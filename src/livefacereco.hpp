@@ -1,6 +1,3 @@
-//
-// Created by Xinghao Chen 2020/7/27
-//
 #include <iostream>
 #include <stdio.h>
 
@@ -26,14 +23,14 @@ using namespace cv;
 const bool largest_face_only=true;
 const bool record_face=true;
 const int distance_threshold = 90;
-const float face_thre=0.40;
-const float true_thre=0.89;
+const float face_thre=0.8;
+const float true_thre=0.8;
 const int jump=10;
 const int input_width = 320;
 const int input_height = 240;
 const int output_width = 320;
 const int output_height = 240;
-const string project_path="/home/pi/LiveFaceReco_RaspberryPi";
+const string project_path="/home/pi4/LiveFaceReco_RaspberryPi";
 //end
 
 const cv::Size frame_size = Size(output_width,output_height);

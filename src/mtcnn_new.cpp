@@ -78,7 +78,7 @@ void mtcnn::nms(std::vector<Bbox> &boundingBox_, std::vector<orderScore> &bboxSc
         if(order<0)continue;
         if(boundingBox_.at(order).exist == false) continue;
         heros.push_back(order);
-        boundingBox_.at(order).exist = false;//delete it
+        boundingBox_.at(order).exist = false;
 
         for(int num=0;num<boundingBox_.size();num++){
             if(boundingBox_.at(num).exist){
@@ -183,10 +183,10 @@ void mtcnn::detect(ncnn::Mat& img_, std::vector<Bbox>& finalBbox_){
     for (size_t i = 0; i < scales_.size(); i++) {
         int hs = (int)ceil(img_h*scales_[i]);
         int ws = (int)ceil(img_w*scales_[i]);
-        //ncnn::Mat in = ncnn::Mat::from_pixels_resize(image_data, ncnn::Mat::PIXEL_RGB2BGR, img_w, img_h, ws, hs);
+
         ncnn::Mat in;
         resize_bilinear(img_, in, ws, hs);
-        //in.substract_mean_normalize(mean_vals, norm_vals);
+
         ncnn::Extractor ex = Pnet.create_extractor();
         ex.set_light_mode(true);
         ex.input("data", in);
@@ -245,7 +245,7 @@ void mtcnn::detect(ncnn::Mat& img_, std::vector<Bbox>& finalBbox_){
             }
         }
     }
-    //printf("secondBbox_.size()=%ld\n", secondBbox_.size());
+
     if(count<1)return;
     nms(secondBbox_, secondBboxScore_, nms_threshold[1]);
     refineAndSquareBbox(secondBbox_, img_h, img_w);
@@ -285,7 +285,7 @@ void mtcnn::detect(ncnn::Mat& img_, std::vector<Bbox>& finalBbox_){
             }
         }
 
-    //printf("thirdBbox_.size()=%ld\n", thirdBbox_.size());
+
     if(count<1)return;
     refineAndSquareBbox(thirdBbox_, img_h, img_w);
     nms(thirdBbox_, thirdBboxScore_, nms_threshold[2], "Min");
@@ -302,6 +302,6 @@ std::vector<Bbox> detect_mtcnn(const cv::Mat &cv_img)
     std::vector<Bbox> finalBbox;
     mm.detect(ncnn_img, finalBbox);
     gettimeofday(&tv2,&tz2);
-    //printf( "%s = %g ms \n ", "Detection All time", getElapse(&tv1, &tv2) );
+
     return finalBbox;
 }

@@ -1,11 +1,8 @@
-//
-// Created by yuanhao on 20-6-12.
-//
+
 #include <opencv2/imgproc.hpp>
 #include "live.h"
 #include "livefacereco.hpp"
-//#include<ctime>
-//#include <iostream>
+
 using namespace std;
 Live::Live() {
     thread_num_ = 2;
@@ -24,7 +21,7 @@ Live::~Live() {
 void Live::LoadModel(std::vector<ModelConfig> &configs) {
     configs_ = configs;
     clock_t start,finish;
-    //start=clock();
+
     model_num_ = static_cast<int>(configs_.size());
     for (int i = 0; i < model_num_; ++i) {
         ncnn::Net *net = new ncnn::Net();
@@ -59,7 +56,7 @@ float Live::Detect(cv::Mat &src, LiveFaceBox &box) {
 
         ncnn::Extractor extractor = nets_[i]->create_extractor();
         extractor.set_light_mode(true);
-        extractor.set_num_threads(thread_num_);
+       
 
         extractor.input(net_input_name_.c_str(), in);
         ncnn::Mat out;
