@@ -1191,1273 +1191,6 @@
 
 
 
-
-
-// //
-// // Optimized Realtime Live Face Recognition GUI for Raspberry Pi 4 + CSI OV5647
-// // - Capture CSI camera using rpicam-vid YUV420 pipe
-// // - Use a dedicated camera thread and keep ONLY the latest frame
-// // - Avoid processing stale buffered frames from rpicam pipe
-// // - Load registered users from users/ folder
-// // - Process inference on resized frame for better FPS
-// // - Run heavy models every N frames and cache result
-// // - GUI only shows FPS, TRUE/FAKE/NO FACE, and recognized name
-// // - Terminal log shows FPS, loop time, infer time, recognition score, live score, status, name
-// // - Press q or ESC to quit
-// // - Press s to save current aligned face into users/
-// //
-
-// #include <math.h>
-// #include <time.h>
-
-// #include <algorithm>
-// #include <atomic>
-// #include <chrono>
-// #include <condition_variable>
-// #include <cstdio>
-// #include <cstdlib>
-// #include <cstring>
-// #include <cstdint>
-// #include <iomanip>
-// #include <iostream>
-// #include <map>
-// #include <mutex>
-// #include <sstream>
-// #include <string>
-// #include <sys/stat.h>
-// #include <sys/types.h>
-// #include <thread>
-// #include <vector>
-
-// #include "livefacereco.hpp"
-// #include "math.hpp"
-// #include "mtcnn_new.h"
-// #include "FacePreprocess.h"
-// // #include "DatasetHandler/image_dataset_handler.hpp"
-
-// #define PI 3.14159265
-
-// using namespace std;
-// using namespace cv;
-
-// // ====================== CONFIG ======================
-// //
-// // Nhớ sửa project_path trong:
-// // 1. src/livefacereco.hpp
-// // 2. src/arcface.h
-// //
-// // Ví dụ:
-// // const string project_path="/home/pi4/LiveFaceReco_RaspberryPi";
-// //
-// // ====================================================
-
-// static const std::string USER_DIR = project_path + "/users";
-
-// // Camera CSI OV5647 capture size.
-// static const int CAMERA_WIDTH  = 640;
-// static const int CAMERA_HEIGHT = 480;
-// static const int CAMERA_FPS    = 60;
-
-// // Kích thước đưa vào MTCNN/ArcFace/Anti-spoof.
-// static const int PROCESS_WIDTH  = 320;
-// static const int PROCESS_HEIGHT = 240;
-
-// // Chỉ chạy full model mỗi N frame.
-// static const int PROCESS_EVERY_N_FRAMES = 3;
-
-// // Tên dùng khi bấm phím s để lưu mặt mới.
-// static const std::string SAVE_NAME = "Cong";
-
-// // GUI size
-// static const int DISPLAY_WIDTH  = 960;
-// static const int DISPLAY_HEIGHT = 720;
-
-// // Không vẽ các bbox phụ để tránh nhìn như có nhiều mặt.
-// static const bool DRAW_ALL_FACES = false;
-
-// // In log terminal mỗi N frame
-// static const int LOG_EVERY_N_FRAMES = 15;
-
-// // rpicam stderr log
-// static const std::string RPICAM_LOG = "/tmp/rpicam_livefacereco.log";
-
-// // ====================================================
-
-// double sum_score, sum_fps, sum_confidence;
-
-// struct MatchResult
-// {
-//     std::string name;
-//     double score;
-//     bool known;
-// };
-
-// struct CachedResult
-// {
-//     bool has_face = false;
-//     bool has_aligned_face = false;
-//     MatchResult match = {"Unknown", -1.0, false};
-//     double live_score = 0.0;
-//     bool is_real = false;
-//     Bbox process_box;
-//     Bbox display_box;
-//     int face_count = 0;
-//     cv::Mat aligned_face;
-//     double last_infer_ms = 0.0;
-// };
-
-// struct PerfInfo
-// {
-//     double fps = 0.0;
-//     double loop_ms = 0.0;
-//     double infer_ms = 0.0;
-// };
-
-// // ====================== RPICAM LATEST-FRAME CAPTURE ======================
-// //
-// // Camera thread luôn đọc rpicam pipe và chỉ giữ frame mới nhất.
-// // Main loop lấy latest frame để tránh xử lý frame cũ trong buffer.
-// //
-
-// class RpiCamLatestCapture
-// {
-// public:
-//     RpiCamLatestCapture(int width, int height, int fps)
-//         : width_(width),
-//           height_(height),
-//           fps_(fps),
-//           frame_size_(static_cast<size_t>(width) * height * 3 / 2),
-//           pipe_(nullptr),
-//           opened_(false),
-//           running_(false),
-//           latest_frame_id_(0),
-//           delivered_frame_id_(0)
-//     {
-//     }
-
-//     bool open()
-//     {
-//         std::ostringstream cmd;
-
-//         cmd << "rpicam-vid "
-//             << "-t 0 "
-//             << "--width " << width_ << " "
-//             << "--height " << height_ << " "
-//             << "--framerate " << fps_ << " "
-//             << "--codec yuv420 "
-//             << "-n "
-//             << "-o - "
-//             << "2>" << RPICAM_LOG;
-
-//         std::cout << "[INFO] Starting CSI camera with command:" << std::endl;
-//         std::cout << "[INFO] " << cmd.str() << std::endl;
-
-//         pipe_ = popen(cmd.str().c_str(), "r");
-
-//         if (!pipe_)
-//         {
-//             std::cerr << "[ERROR] Cannot start rpicam-vid." << std::endl;
-//             opened_ = false;
-//             running_ = false;
-//             return false;
-//         }
-
-//         opened_ = true;
-//         running_ = true;
-
-//         capture_thread_ = std::thread(&RpiCamLatestCapture::captureLoop, this);
-
-//         return true;
-//     }
-
-//     bool isOpened() const
-//     {
-//         return opened_ && running_;
-//     }
-
-//     bool getFrame(cv::Mat& out_frame, uint64_t& out_frame_id)
-//     {
-//         std::unique_lock<std::mutex> lock(mutex_);
-
-//         cond_.wait(
-//             lock,
-//             [this]()
-//             {
-//                 return !running_ || latest_frame_id_ != delivered_frame_id_;
-//             }
-//         );
-
-//         if (!running_ && latest_frame_.empty())
-//         {
-//             return false;
-//         }
-
-//         if (latest_frame_.empty())
-//         {
-//             return false;
-//         }
-
-//         out_frame = latest_frame_.clone();
-//         delivered_frame_id_ = latest_frame_id_;
-//         out_frame_id = latest_frame_id_;
-
-//         return true;
-//     }
-
-//     void close()
-//     {
-//         running_ = false;
-//         cond_.notify_all();
-
-//         if (capture_thread_.joinable())
-//         {
-//             capture_thread_.join();
-//         }
-
-//         if (pipe_)
-//         {
-//             pclose(pipe_);
-//             pipe_ = nullptr;
-//         }
-
-//         opened_ = false;
-//     }
-
-//     ~RpiCamLatestCapture()
-//     {
-//         close();
-//     }
-
-// private:
-//     void captureLoop()
-//     {
-//         std::vector<unsigned char> buffer(frame_size_);
-
-//         while (running_)
-//         {
-//             size_t total_read = 0;
-
-//             while (running_ && total_read < frame_size_)
-//             {
-//                 size_t n = fread(
-//                     buffer.data() + total_read,
-//                     1,
-//                     frame_size_ - total_read,
-//                     pipe_
-//                 );
-
-//                 if (n == 0)
-//                 {
-//                     if (running_)
-//                     {
-//                         std::cerr << "[ERROR] rpicam stream ended or read failed." << std::endl;
-//                         std::cerr << "[HINT] Check log: cat " << RPICAM_LOG << std::endl;
-//                     }
-
-//                     running_ = false;
-//                     cond_.notify_all();
-//                     return;
-//                 }
-
-//                 total_read += n;
-//             }
-
-//             if (!running_)
-//             {
-//                 break;
-//             }
-
-//             cv::Mat yuv(
-//                 height_ * 3 / 2,
-//                 width_,
-//                 CV_8UC1,
-//                 buffer.data()
-//             );
-
-//             cv::Mat bgr;
-//             cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
-
-//             {
-//                 std::lock_guard<std::mutex> lock(mutex_);
-//                 latest_frame_ = bgr.clone();
-//                 latest_frame_id_++;
-//             }
-
-//             cond_.notify_one();
-//         }
-
-//         cond_.notify_all();
-//     }
-
-// private:
-//     int width_;
-//     int height_;
-//     int fps_;
-//     size_t frame_size_;
-
-//     FILE* pipe_;
-//     bool opened_;
-//     std::atomic<bool> running_;
-
-//     std::thread capture_thread_;
-
-//     std::mutex mutex_;
-//     std::condition_variable cond_;
-
-//     cv::Mat latest_frame_;
-//     uint64_t latest_frame_id_;
-//     uint64_t delivered_frame_id_;
-// };
-
-// // ====================== UTILS ======================
-
-// static void ensureDir(const std::string& path)
-// {
-//     mkdir(path.c_str(), 0755);
-// }
-
-// static double clamp01(double v)
-// {
-//     if (v < 0.0) return 0.0;
-//     if (v > 1.0) return 1.0;
-//     return v;
-// }
-
-// static std::string fmtDouble(double v, int precision = 2)
-// {
-//     std::ostringstream oss;
-//     oss << std::fixed << std::setprecision(precision) << v;
-//     return oss.str();
-// }
-
-// std::vector<std::string> split(const std::string& s, char seperator)
-// {
-//     std::vector<std::string> output;
-//     std::string::size_type prev_pos = 0, pos = 0;
-
-//     while ((pos = s.find(seperator, pos)) != std::string::npos)
-//     {
-//         std::string substring(s.substr(prev_pos, pos - prev_pos));
-//         output.push_back(substring);
-//         prev_pos = ++pos;
-//     }
-
-//     output.push_back(s.substr(prev_pos, pos - prev_pos));
-//     return output;
-// }
-
-// static std::string basenameFromPath(const std::string& path)
-// {
-//     std::vector<std::string> parts = split(path, '/');
-//     if (parts.empty()) return path;
-//     return parts.back();
-// }
-
-// static std::string removeExtension(const std::string& filename)
-// {
-//     std::size_t dot_pos = filename.find_last_of('.');
-//     if (dot_pos == std::string::npos) return filename;
-//     return filename.substr(0, dot_pos);
-// }
-
-// static std::string extractPersonName(const std::string& img_path)
-// {
-//     std::string filename = basenameFromPath(img_path);
-//     std::string name_no_ext = removeExtension(filename);
-
-//     std::size_t underscore_pos = name_no_ext.find_last_of('_');
-//     if (underscore_pos == std::string::npos)
-//     {
-//         return name_no_ext;
-//     }
-
-//     return name_no_ext.substr(0, underscore_pos);
-// }
-
-// // ====================== FACE HELPERS ======================
-
-// cv::Mat createFaceLandmarkGTMatrix()
-// {
-//     float v1[5][2] = {
-//         {30.2946f, 51.6963f},
-//         {65.5318f, 51.5014f},
-//         {48.0252f, 71.7366f},
-//         {33.5493f, 92.3655f},
-//         {62.7299f, 92.2041f}
-//     };
-
-//     cv::Mat src(5, 2, CV_32FC1, v1);
-//     memcpy(src.data, v1, 2 * 5 * sizeof(float));
-//     return src.clone();
-// }
-
-// cv::Mat createFaceLandmarkMatrixfromBBox(const Bbox& box)
-// {
-//     float v2[5][2] = {
-//         {box.ppoint[0], box.ppoint[5]},
-//         {box.ppoint[1], box.ppoint[6]},
-//         {box.ppoint[2], box.ppoint[7]},
-//         {box.ppoint[3], box.ppoint[8]},
-//         {box.ppoint[4], box.ppoint[9]},
-//     };
-
-//     cv::Mat dst(5, 2, CV_32FC1, v2);
-//     memcpy(dst.data, v2, 2 * 5 * sizeof(float));
-//     return dst.clone();
-// }
-
-// Bbox getLargestBboxFromBboxVec(const std::vector<Bbox>& faces_info)
-// {
-//     if (faces_info.empty())
-//     {
-//         return Bbox();
-//     }
-
-//     int largest_idx = 0;
-//     float largest_area = 0.0f;
-
-//     for (int i = 0; i < (int)faces_info.size(); i++)
-//     {
-//         float w = faces_info[i].x2 - faces_info[i].x1;
-//         float h = faces_info[i].y2 - faces_info[i].y1;
-//         float area = w * h;
-
-//         if (area > largest_area)
-//         {
-//             largest_area = area;
-//             largest_idx = i;
-//         }
-//     }
-
-//     return faces_info[largest_idx];
-// }
-
-// static Bbox scaleBbox(const Bbox& box, float sx, float sy)
-// {
-//     Bbox out = box;
-
-//     out.x1 = box.x1 * sx;
-//     out.y1 = box.y1 * sy;
-//     out.x2 = box.x2 * sx;
-//     out.y2 = box.y2 * sy;
-
-//     for (int i = 0; i < 5; i++)
-//     {
-//         out.ppoint[i] = box.ppoint[i] * sx;
-//         out.ppoint[i + 5] = box.ppoint[i + 5] * sy;
-//     }
-
-//     return out;
-// }
-
-// LiveFaceBox Bbox2LiveFaceBox(const Bbox& box)
-// {
-//     LiveFaceBox live_box = {box.x1, box.y1, box.x2, box.y2};
-//     return live_box;
-// }
-
-// cv::Mat alignFaceImage(
-//     const cv::Mat& frame,
-//     const Bbox& bbox,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     cv::Mat face_landmark = createFaceLandmarkMatrixfromBBox(bbox);
-
-//     cv::Mat transf = FacePreprocess::similarTransform(
-//         face_landmark,
-//         gt_landmark_matrix
-//     );
-
-//     cv::Mat aligned = frame.clone();
-
-//     cv::warpPerspective(
-//         frame,
-//         aligned,
-//         transf,
-//         cv::Size(96, 112),
-//         INTER_LINEAR
-//     );
-
-//     cv::resize(
-//         aligned,
-//         aligned,
-//         cv::Size(112, 112),
-//         0,
-//         0,
-//         INTER_LINEAR
-//     );
-
-//     return aligned.clone();
-// }
-
-// // ====================== DRAW HELPERS ======================
-
-// static void drawTextWithBg(
-//     cv::Mat& img,
-//     const std::string& text,
-//     cv::Point org,
-//     double scale,
-//     cv::Scalar text_color,
-//     cv::Scalar bg_color,
-//     int thickness = 2
-// )
-// {
-//     int baseline = 0;
-
-//     cv::Size text_size = cv::getTextSize(
-//         text,
-//         cv::FONT_HERSHEY_SIMPLEX,
-//         scale,
-//         thickness,
-//         &baseline
-//     );
-
-//     cv::Rect bg_rect(
-//         org.x - 4,
-//         org.y - text_size.height - 6,
-//         text_size.width + 8,
-//         text_size.height + baseline + 10
-//     );
-
-//     bg_rect &= cv::Rect(0, 0, img.cols, img.rows);
-
-//     cv::rectangle(img, bg_rect, bg_color, cv::FILLED);
-
-//     cv::putText(
-//         img,
-//         text,
-//         org,
-//         cv::FONT_HERSHEY_SIMPLEX,
-//         scale,
-//         text_color,
-//         thickness
-//     );
-// }
-
-// static void drawAllDetectedFaces(
-//     cv::Mat& frame,
-//     const std::vector<Bbox>& faces
-// )
-// {
-//     if (!DRAW_ALL_FACES)
-//     {
-//         return;
-//     }
-
-//     for (const auto& box : faces)
-//     {
-//         cv::rectangle(
-//             frame,
-//             cv::Point((int)box.x1, (int)box.y1),
-//             cv::Point((int)box.x2, (int)box.y2),
-//             cv::Scalar(160, 160, 160),
-//             1
-//         );
-//     }
-// }
-
-// static void drawMainFaceResult(
-//     cv::Mat& frame,
-//     const CachedResult& cached,
-//     const PerfInfo& perf
-// )
-// {
-//     const Bbox& box = cached.display_box;
-//     const MatchResult& match = cached.match;
-
-//     bool unlock_ok = cached.is_real && match.known;
-
-//     cv::Scalar box_color;
-//     cv::Scalar status_bg;
-
-//     if (unlock_ok)
-//     {
-//         box_color = cv::Scalar(0, 255, 0);
-//         status_bg = cv::Scalar(0, 120, 0);
-//     }
-//     else if (!cached.is_real)
-//     {
-//         box_color = cv::Scalar(0, 0, 255);
-//         status_bg = cv::Scalar(0, 0, 160);
-//     }
-//     else
-//     {
-//         box_color = cv::Scalar(0, 255, 255);
-//         status_bg = cv::Scalar(0, 120, 120);
-//     }
-
-//     cv::rectangle(
-//         frame,
-//         cv::Point((int)box.x1, (int)box.y1),
-//         cv::Point((int)box.x2, (int)box.y2),
-//         box_color,
-//         3
-//     );
-
-//     std::string status_text;
-
-//     if (!cached.is_real)
-//     {
-//         status_text = "FAKE FACE";
-//     }
-//     else if (match.known)
-//     {
-//         status_text = "TRUE FACE";
-//     }
-//     else
-//     {
-//         status_text = "TRUE FACE";
-//     }
-
-//     std::string fps_text =
-//         "FPS: " + fmtDouble(perf.fps, 1);
-
-//     std::string name_text =
-//         "Name: " + match.name;
-
-//     int x = std::max(10, (int)box.x1);
-//     int y = std::max(30, (int)box.y1 - 15);
-
-//     drawTextWithBg(
-//         frame,
-//         fps_text,
-//         cv::Point(15, 35),
-//         0.75,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         status_text,
-//         cv::Point(x, y),
-//         0.80,
-//         cv::Scalar(255, 255, 255),
-//         status_bg,
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         name_text,
-//         cv::Point(x, y + 38),
-//         0.70,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(40, 40, 40),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "Press q/ESC: quit | Press s: save current face",
-//         cv::Point(15, frame.rows - 20),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         1
-//     );
-// }
-
-// static void drawNoFaceUI(
-//     cv::Mat& frame,
-//     const PerfInfo& perf
-// )
-// {
-//     drawTextWithBg(
-//         frame,
-//         "FPS: " + fmtDouble(perf.fps, 1),
-//         cv::Point(15, 35),
-//         0.75,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "No face detected",
-//         cv::Point(15, 75),
-//         0.8,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 160),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "Press q/ESC: quit",
-//         cv::Point(15, frame.rows - 20),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         1
-//     );
-// }
-
-// // ====================== MODEL / USER DB ======================
-
-// void loadLiveModel(Live& live)
-// {
-//     ModelConfig config1 = {
-//         2.7f,
-//         0.0f,
-//         0.0f,
-//         80,
-//         80,
-//         "model_1",
-//         false
-//     };
-
-//     ModelConfig config2 = {
-//         4.0f,
-//         0.0f,
-//         0.0f,
-//         80,
-//         80,
-//         "model_2",
-//         false
-//     };
-
-//     vector<ModelConfig> configs;
-//     configs.emplace_back(config1);
-//     configs.emplace_back(config2);
-
-//     live.LoadModel(configs);
-// }
-
-// static cv::Mat prepareUserImageForFeature(
-//     const cv::Mat& input_img,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     if (input_img.empty())
-//     {
-//         return cv::Mat();
-//     }
-
-//     if (input_img.cols == 112 && input_img.rows == 112)
-//     {
-//         return input_img.clone();
-//     }
-
-//     std::vector<Bbox> faces = detect_mtcnn(input_img);
-
-//     if (!faces.empty())
-//     {
-//         Bbox largest = getLargestBboxFromBboxVec(faces);
-//         return alignFaceImage(input_img, largest, gt_landmark_matrix);
-//     }
-
-//     cv::Mat resized;
-//     cv::resize(
-//         input_img,
-//         resized,
-//         cv::Size(112, 112),
-//         0,
-//         0,
-//         INTER_LINEAR
-//     );
-
-//     return resized;
-// }
-
-// static void loadRegisteredUsers(
-//     Arcface& facereco,
-//     std::map<std::string, std::vector<cv::Mat>>& user_descriptors,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     ensureDir(USER_DIR);
-
-//     std::vector<cv::String> image_names;
-//     std::vector<cv::String> jpg_names;
-//     std::vector<cv::String> jpeg_names;
-//     std::vector<cv::String> png_names;
-
-//     cv::glob(USER_DIR + "/*.jpg", jpg_names, false);
-//     cv::glob(USER_DIR + "/*.jpeg", jpeg_names, false);
-//     cv::glob(USER_DIR + "/*.png", png_names, false);
-
-//     image_names.insert(image_names.end(), jpg_names.begin(), jpg_names.end());
-//     image_names.insert(image_names.end(), jpeg_names.begin(), jpeg_names.end());
-//     image_names.insert(image_names.end(), png_names.begin(), png_names.end());
-
-//     if (image_names.empty())
-//     {
-//         std::cerr << "[ERROR] No image files found in: "
-//                   << USER_DIR << std::endl;
-//         std::cerr << "[HINT] Put registered face images into users/ folder."
-//                   << std::endl;
-//         std::cerr << "[HINT] Example: users/Cong_001.jpg, users/Duc_001.jpg"
-//                   << std::endl;
-//         exit(0);
-//     }
-
-//     std::cout << "[INFO] Loading registered users from: "
-//               << USER_DIR << std::endl;
-//     std::cout << "[INFO] Total user images: "
-//               << image_names.size() << std::endl;
-
-//     int loaded = 0;
-//     int skipped = 0;
-
-//     for (const auto& img_name_cv : image_names)
-//     {
-//         std::string img_name = std::string(img_name_cv);
-//         std::string person_name = extractPersonName(img_name);
-
-//         cv::Mat img = cv::imread(img_name);
-
-//         if (img.empty())
-//         {
-//             std::cerr << "[WARN] Cannot read image: "
-//                       << img_name << std::endl;
-//             skipped++;
-//             continue;
-//         }
-
-//         cv::Mat face_img = prepareUserImageForFeature(
-//             img,
-//             gt_landmark_matrix
-//         );
-
-//         if (face_img.empty())
-//         {
-//             std::cerr << "[WARN] Cannot prepare face image: "
-//                       << img_name << std::endl;
-//             skipped++;
-//             continue;
-//         }
-
-//         cv::Mat descriptor = facereco.getFeature(face_img);
-//         descriptor = Statistics::zScore(descriptor);
-
-//         user_descriptors[person_name].push_back(descriptor);
-//         loaded++;
-
-//         std::cout << "[LOAD] "
-//                   << person_name
-//                   << " <= "
-//                   << basenameFromPath(img_name)
-//                   << std::endl;
-//     }
-
-//     std::cout << "[INFO] Loaded descriptors: "
-//               << loaded << std::endl;
-//     std::cout << "[INFO] Skipped images: "
-//               << skipped << std::endl;
-//     std::cout << "[INFO] Registered people: "
-//               << user_descriptors.size() << std::endl;
-
-//     if (user_descriptors.empty())
-//     {
-//         std::cerr << "[ERROR] No valid user descriptor loaded."
-//                   << std::endl;
-//         exit(0);
-//     }
-// }
-
-// static MatchResult findBestMatch(
-//     const std::map<std::string, std::vector<cv::Mat>>& user_descriptors,
-//     const cv::Mat& face_descriptor
-// )
-// {
-//     MatchResult result;
-//     result.name = "Unknown";
-//     result.score = -1.0;
-//     result.known = false;
-
-//     for (const auto& user_pair : user_descriptors)
-//     {
-//         const std::string& name = user_pair.first;
-//         const std::vector<cv::Mat>& descriptors = user_pair.second;
-
-//         for (const auto& ref_desc : descriptors)
-//         {
-//             double score = Statistics::cosineDistance(
-//                 ref_desc,
-//                 face_descriptor
-//             );
-
-//             if (score > result.score)
-//             {
-//                 result.score = score;
-//                 result.name = name;
-//             }
-//         }
-//     }
-
-//     if (result.score > face_thre)
-//     {
-//         result.known = true;
-//     }
-//     else
-//     {
-//         result.name = "Unknown";
-//         result.known = false;
-//     }
-
-//     return result;
-// }
-
-// static std::string makeSaveFileName(const std::string& name)
-// {
-//     auto now = std::chrono::system_clock::now();
-
-//     long long ms =
-//         std::chrono::duration_cast<std::chrono::milliseconds>(
-//             now.time_since_epoch()
-//         ).count();
-
-//     return USER_DIR + "/" + name + "_" + std::to_string(ms) + ".jpg";
-// }
-
-// // ====================== MAIN PIPELINE ======================
-
-// int MTCNNDetection()
-// {
-//     std::cout << "OpenCV Version: "
-//               << CV_MAJOR_VERSION << "."
-//               << CV_MINOR_VERSION << "."
-//               << CV_SUBMINOR_VERSION << std::endl;
-
-//     std::cout << "[INFO] project_path = "
-//               << project_path << std::endl;
-//     std::cout << "[INFO] USER_DIR     = "
-//               << USER_DIR << std::endl;
-//     std::cout << "[INFO] CSI CAMERA   = "
-//               << CAMERA_WIDTH << "x" << CAMERA_HEIGHT
-//               << "@" << CAMERA_FPS << std::endl;
-//     std::cout << "[INFO] PROCESS SIZE = "
-//               << PROCESS_WIDTH << "x" << PROCESS_HEIGHT << std::endl;
-//     std::cout << "[INFO] PROCESS STEP = every "
-//               << PROCESS_EVERY_N_FRAMES << " frames" << std::endl;
-//     std::cout << "[INFO] face_thre    = "
-//               << face_thre << std::endl;
-//     std::cout << "[INFO] true_thre    = "
-//               << true_thre << std::endl;
-
-//     ensureDir(USER_DIR);
-
-//     cv::Mat face_landmark_gt_matrix = createFaceLandmarkGTMatrix();
-
-//     Arcface facereco;
-
-//     std::map<std::string, std::vector<cv::Mat>> user_descriptors;
-
-//     loadRegisteredUsers(
-//         facereco,
-//         user_descriptors,
-//         face_landmark_gt_matrix
-//     );
-
-//     Live live;
-//     loadLiveModel(live);
-
-//     RpiCamLatestCapture cap(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS);
-
-//     if (!cap.open())
-//     {
-//         std::cerr << "[ERROR] Cannot open CSI camera using rpicam-vid."
-//                   << std::endl;
-//         std::cerr << "[HINT] Test camera first:" << std::endl;
-//         std::cerr << "       rpicam-hello --list-cameras" << std::endl;
-//         std::cerr << "       rpicam-hello" << std::endl;
-//         std::cerr << "[HINT] Check log:" << std::endl;
-//         std::cerr << "       cat " << RPICAM_LOG << std::endl;
-//         return -1;
-//     }
-
-//     cv::namedWindow("LiveFaceReco - Smart Lock", cv::WINDOW_NORMAL);
-//     cv::resizeWindow(
-//         "LiveFaceReco - Smart Lock",
-//         DISPLAY_WIDTH,
-//         DISPLAY_HEIGHT
-//     );
-
-//     cv::Mat frame;
-//     cv::Mat process_frame;
-//     cv::Mat display_frame;
-
-//     CachedResult cached;
-
-//     int frame_count = 0;
-
-//     double last_infer_ms = 0.0;
-//     double last_loop_ms = 0.0;
-//     double instant_fps = 0.0;
-
-//     uint64_t camera_frame_id = 0;
-
-//     PerfInfo perf;
-
-//     std::cout << "[INFO] CSI camera started." << std::endl;
-//     std::cout << "[INFO] Capture mode: latest-frame only, no stale pipe backlog." << std::endl;
-//     std::cout << "[INFO] GUI: FPS + TRUE/FAKE/NO FACE + Name only." << std::endl;
-//     std::cout << "[INFO] Terminal: FPS + loop_ms + infer_ms + rec_score + live_score + status + name." << std::endl;
-//     std::cout << "[INFO] Press q or ESC to quit." << std::endl;
-//     std::cout << "[INFO] Press s to save current aligned face into users/."
-//               << std::endl;
-
-//     while (cap.isOpened())
-//     {
-//         auto loop_start = std::chrono::steady_clock::now();
-
-//         bool got_frame = cap.getFrame(frame, camera_frame_id);
-
-//         if (!got_frame || frame.empty())
-//         {
-//             continue;
-//         }
-
-//         frame_count++;
-
-//         display_frame = frame.clone();
-
-//         bool should_process =
-//             (frame_count % PROCESS_EVERY_N_FRAMES == 0) ||
-//             (frame_count == 1);
-
-//         if (should_process)
-//         {
-//             auto infer_start = std::chrono::steady_clock::now();
-
-//             cv::resize(
-//                 frame,
-//                 process_frame,
-//                 cv::Size(PROCESS_WIDTH, PROCESS_HEIGHT),
-//                 0,
-//                 0,
-//                 INTER_LINEAR
-//             );
-
-//             float sx = static_cast<float>(frame.cols) / PROCESS_WIDTH;
-//             float sy = static_cast<float>(frame.rows) / PROCESS_HEIGHT;
-
-//             std::vector<Bbox> faces_info = detect_mtcnn(process_frame);
-
-//             if (!faces_info.empty())
-//             {
-//                 Bbox largest_process_box =
-//                     getLargestBboxFromBboxVec(faces_info);
-
-//                 Bbox largest_display_box =
-//                     scaleBbox(largest_process_box, sx, sy);
-
-//                 LiveFaceBox live_face_box =
-//                     Bbox2LiveFaceBox(largest_process_box);
-
-//                 cv::Mat aligned_img = alignFaceImage(
-//                     process_frame,
-//                     largest_process_box,
-//                     face_landmark_gt_matrix
-//                 );
-
-//                 cv::Mat face_descriptor = facereco.getFeature(aligned_img);
-//                 face_descriptor = Statistics::zScore(face_descriptor);
-
-//                 MatchResult match = findBestMatch(
-//                     user_descriptors,
-//                     face_descriptor
-//                 );
-
-//                 double live_score =
-//                     live.Detect(process_frame, live_face_box);
-
-//                 live_score = clamp01(live_score);
-//                 bool is_real = live_score > true_thre;
-
-//                 cached.has_face = true;
-//                 cached.has_aligned_face = true;
-//                 cached.match = match;
-//                 cached.live_score = live_score;
-//                 cached.is_real = is_real;
-//                 cached.process_box = largest_process_box;
-//                 cached.display_box = largest_display_box;
-
-//                 // Pipeline chỉ dùng duy nhất bbox lớn nhất.
-//                 cached.face_count = 1;
-
-//                 cached.aligned_face = aligned_img.clone();
-
-//                 if (DRAW_ALL_FACES)
-//                 {
-//                     std::vector<Bbox> scaled_faces;
-//                     for (const auto& fb : faces_info)
-//                     {
-//                         scaled_faces.push_back(scaleBbox(fb, sx, sy));
-//                     }
-//                     drawAllDetectedFaces(display_frame, scaled_faces);
-//                 }
-//             }
-//             else
-//             {
-//                 cached.has_face = false;
-//                 cached.has_aligned_face = false;
-//                 cached.match = {"Unknown", -1.0, false};
-//                 cached.live_score = 0.0;
-//                 cached.is_real = false;
-//                 cached.face_count = 0;
-//                 cached.aligned_face.release();
-//             }
-
-//             auto infer_end = std::chrono::steady_clock::now();
-
-//             last_infer_ms =
-//                 std::chrono::duration<double, std::milli>(
-//                     infer_end - infer_start
-//                 ).count();
-
-//             cached.last_infer_ms = last_infer_ms;
-//         }
-
-//         // Tính metric trước khi vẽ GUI để GUI và terminal dùng cùng số.
-//         auto metric_time = std::chrono::steady_clock::now();
-
-//         double loop_dt = std::chrono::duration<double>(
-//             metric_time - loop_start
-//         ).count();
-
-//         if (loop_dt > 0.000001)
-//         {
-//             last_loop_ms = loop_dt * 1000.0;
-//             instant_fps = 1.0 / loop_dt;
-//         }
-//         else
-//         {
-//             last_loop_ms = 0.0;
-//             instant_fps = 0.0;
-//         }
-
-//         perf.fps = instant_fps;
-//         perf.loop_ms = last_loop_ms;
-//         perf.infer_ms = last_infer_ms;
-
-//         if (cached.has_face)
-//         {
-//             drawMainFaceResult(display_frame, cached, perf);
-//         }
-//         else
-//         {
-//             drawNoFaceUI(display_frame, perf);
-//         }
-
-//         cv::imshow("LiveFaceReco - Smart Lock", display_frame);
-
-//         int key = cv::waitKey(1);
-
-//         if (key == 27 || key == 'q' || key == 'Q')
-//         {
-//             break;
-//         }
-
-//         if (key == 's' || key == 'S')
-//         {
-//             if (cached.has_aligned_face && !cached.aligned_face.empty())
-//             {
-//                 std::string save_path = makeSaveFileName(SAVE_NAME);
-
-//                 bool ok = cv::imwrite(save_path, cached.aligned_face);
-
-//                 if (ok)
-//                 {
-//                     cv::Mat desc = facereco.getFeature(cached.aligned_face);
-//                     desc = Statistics::zScore(desc);
-//                     user_descriptors[SAVE_NAME].push_back(desc);
-
-//                     std::cout << "[SAVE] Saved new face: "
-//                               << save_path << std::endl;
-//                     std::cout << "[SAVE] Added descriptor to current database."
-//                               << std::endl;
-//                 }
-//                 else
-//                 {
-//                     std::cerr << "[ERROR] Cannot save image: "
-//                               << save_path << std::endl;
-//                 }
-//             }
-//             else
-//             {
-//                 std::cout << "[WARN] No current face to save."
-//                           << std::endl;
-//             }
-//         }
-
-//         if (frame_count % LOG_EVERY_N_FRAMES == 0)
-//         {
-//             std::cout << "[FRAME " << frame_count << "] ";
-
-//             if (cached.has_face)
-//             {
-//                 std::string status_text = cached.is_real ? "TRUE" : "FAKE";
-
-//                 std::cout << "fps="
-//                           << fmtDouble(perf.fps, 1)
-//                           << " | loop_ms="
-//                           << fmtDouble(perf.loop_ms, 1)
-//                           << " | infer_ms="
-//                           << fmtDouble(perf.infer_ms, 1)
-//                           << " | face=yes"
-//                           << " | status="
-//                           << status_text
-//                           << " | name="
-//                           << cached.match.name
-//                           << " | known="
-//                           << (cached.match.known ? "yes" : "no")
-//                           << " | rec_score="
-//                           << fmtDouble(cached.match.score, 3)
-//                           << " | live_score="
-//                           << fmtDouble(cached.live_score, 3)
-//                           << std::endl;
-//             }
-//             else
-//             {
-//                 std::cout << "fps="
-//                           << fmtDouble(perf.fps, 1)
-//                           << " | loop_ms="
-//                           << fmtDouble(perf.loop_ms, 1)
-//                           << " | infer_ms="
-//                           << fmtDouble(perf.infer_ms, 1)
-//                           << " | face=no"
-//                           << " | status=NO_FACE"
-//                           << " | name=Unknown"
-//                           << " | known=no"
-//                           << " | rec_score=-1.000"
-//                           << " | live_score=0.000"
-//                           << std::endl;
-//             }
-//         }
-//     }
-
-//     cap.close();
-//     cv::destroyAllWindows();
-
-//     std::cout << "[INFO] CSI camera stopped." << std::endl;
-
-//     return 0;
-// }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 //
 // Optimized Realtime Live Face Recognition GUI for Raspberry Pi 4 + CSI OV5647
 // - Capture CSI camera using rpicam-vid YUV420 pipe
@@ -2479,7 +1212,11 @@
 #include <time.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -2488,11 +1225,16 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
 #include <vector>
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 #include "livefacereco.hpp"
 #include "math.hpp"
@@ -2547,6 +1289,48 @@ static const int LOG_EVERY_N_FRAMES = 15;
 
 // rpicam stderr log
 static const std::string RPICAM_LOG = "/tmp/rpicam_livefacereco.log";
+
+
+// ====================== FIRESTORE CONFIG ======================
+//
+// Firebase Authentication account dùng chung cho Raspberry Pi và ESP32.
+// Raspberry Pi trong file này CHỈ gửi:
+//   - SPOOF_DETECTED : phát hiện FAKE FACE
+//   - UNKNOWN_FACE   : REAL FACE nhưng không nhận diện được
+//
+// Các event khác như WRONG_PIN / ACCESS_ACCEPTED dành cho ESP32 sau này,
+// Raspberry Pi không tạo các log đó trong code này.
+//
+static const bool ENABLE_FIRESTORE_LOG = true;
+
+static const std::string FIREBASE_PROJECT_ID = "smartlock-7f70d";
+static const std::string FIREBASE_WEB_API_KEY =
+    "AIzaSyBNz7bVsc8PsVJRO8IXfWZvw7YlRQ9LJa0";
+static const std::string FIREBASE_DEVICE_EMAIL =
+    "smartlock-device@gmail.com";
+static const std::string FIREBASE_DEVICE_PASSWORD =
+    "123456";
+
+// Chỉ ghi Firestore khi MỘT ĐIỀU KIỆN FAIL giữ liên tục đủ 5 giây.
+//
+// Hai điều kiện được tính timer ĐỘC LẬP:
+//   - !is_real         giữ đủ 5 giây -> SPOOF_DETECTED
+//   - !match.known     giữ đủ 5 giây -> UNKNOWN_FACE
+//
+// Ví dụ:
+//   - Name luôn Unknown trong 5 giây nhưng REAL/FAKE nhảy:
+//       timer UNKNOWN vẫn chạy và ghi UNKNOWN_FACE.
+//   - Face luôn FAKE trong 5 giây nhưng match Known/Unknown nhảy:
+//       timer FAKE vẫn chạy và ghi SPOOF_DETECTED.
+//   - Cả hai cùng đủ 5 giây ở cùng một lần kiểm tra:
+//       ưu tiên ghi SPOOF_DETECTED.
+//
+static const double FIRESTORE_DENIED_HOLD_SECONDS = 5.0;
+
+// Nếu mạng lỗi lâu, chỉ giữ tối đa 32 log đang chờ trong RAM.
+static const std::size_t FIRESTORE_MAX_QUEUE_SIZE = 32;
+
+// ====================================================
 
 // ====================== PREPROCESS CONFIG ======================
 //
@@ -2625,6 +1409,744 @@ struct AddUserState
     bool saved_current_batch = false;
     std::string message = "Click INPUT NAME, type name, then capture 10 REAL faces.";
 };
+
+
+/*
+ * Forward declaration:
+ * PiDeniedEventGate nằm phía trên phần UTILS nhưng cần in số thời gian bằng fmtDouble().
+ * Hàm thật được định nghĩa phía dưới trong phần UTILS.
+ */
+static std::string fmtDouble(double v, int precision);
+
+
+
+// ====================== FIRESTORE ASYNC LOGGER ======================
+//
+// Gửi HTTPS trên thread riêng để không chặn camera + inference loop.
+// createdAt dùng REQUEST_TIME của Firestore server để khớp Rule:
+//     request.resource.data.createdAt == request.time
+//
+struct FirestoreLogEvent
+{
+    std::string reason;
+};
+
+class FirestoreLogger
+{
+public:
+    FirestoreLogger()
+        : enabled_(false),
+          running_(false),
+          curl_initialized_(false),
+          token_expire_time_(std::chrono::system_clock::time_point::min()),
+          document_counter_(0)
+    {
+    }
+
+    ~FirestoreLogger()
+    {
+        stop();
+    }
+
+    bool start()
+    {
+        if (enabled_.load())
+        {
+            return true;
+        }
+
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
+        {
+            std::cerr << "[FIRESTORE] curl_global_init failed. Logger OFF."
+                      << std::endl;
+            return false;
+        }
+
+        curl_initialized_ = true;
+        enabled_.store(true);
+        running_.store(true);
+        worker_thread_ = std::thread(&FirestoreLogger::workerLoop, this);
+
+        std::cout << "[FIRESTORE] Logger ON."
+                  << " Pi only sends SPOOF_DETECTED or UNKNOWN_FACE."
+                  << std::endl;
+        return true;
+    }
+
+    void stop()
+    {
+        if (!enabled_.load())
+        {
+            return;
+        }
+
+        running_.store(false);
+        queue_cv_.notify_all();
+
+        if (worker_thread_.joinable())
+        {
+            worker_thread_.join();
+        }
+
+        enabled_.store(false);
+
+        if (curl_initialized_)
+        {
+            curl_global_cleanup();
+            curl_initialized_ = false;
+        }
+
+        std::cout << "[FIRESTORE] Logger stopped." << std::endl;
+    }
+
+    bool isEnabled() const
+    {
+        return enabled_.load();
+    }
+
+    bool enqueueDeniedEvent(const std::string& reason)
+    {
+        if (!enabled_.load())
+        {
+            return false;
+        }
+
+        // Chặn cứng ở phía Pi: không thể gửi reason khác.
+        if (reason != "SPOOF_DETECTED" && reason != "UNKNOWN_FACE")
+        {
+            std::cerr << "[FIRESTORE] Block invalid Pi event: "
+                      << reason << std::endl;
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+
+            if (event_queue_.size() >= FIRESTORE_MAX_QUEUE_SIZE)
+            {
+                event_queue_.pop_front();
+                std::cerr << "[FIRESTORE] Queue full, drop oldest log."
+                          << std::endl;
+            }
+
+            event_queue_.push_back({reason});
+        }
+
+        queue_cv_.notify_one();
+        return true;
+    }
+
+private:
+    struct HttpResponse
+    {
+        long status_code = 0;
+        std::string body;
+        std::string error;
+    };
+
+    static size_t curlWriteCallback(
+        void* contents,
+        size_t size,
+        size_t nmemb,
+        void* user_data
+    )
+    {
+        const size_t total = size * nmemb;
+        std::string* output = static_cast<std::string*>(user_data);
+        output->append(static_cast<char*>(contents), total);
+        return total;
+    }
+
+    static bool isSuccess(long status_code)
+    {
+        return status_code >= 200 && status_code < 300;
+    }
+
+    static std::string shortResponse(const std::string& body)
+    {
+        const size_t max_size = 250;
+
+        if (body.size() <= max_size)
+        {
+            return body;
+        }
+
+        return body.substr(0, max_size) + "...";
+    }
+
+    HttpResponse post(
+        const std::string& url,
+        const std::string& body,
+        const std::string& content_type,
+        const std::string& bearer_token = ""
+    )
+    {
+        HttpResponse response;
+        CURL* curl = curl_easy_init();
+
+        if (!curl)
+        {
+            response.error = "curl_easy_init failed";
+            return response;
+        }
+
+        struct curl_slist* headers = nullptr;
+        std::string type_header = "Content-Type: " + content_type;
+        headers = curl_slist_append(headers, type_header.c_str());
+
+        std::string auth_header;
+
+        if (!bearer_token.empty())
+        {
+            auth_header = "Authorization: Bearer " + bearer_token;
+            headers = curl_slist_append(headers, auth_header.c_str());
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 4000L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 8000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "SmartLockPi-Firestore/1.0");
+
+        CURLcode curl_result = curl_easy_perform(curl);
+
+        if (curl_result != CURLE_OK)
+        {
+            response.error = curl_easy_strerror(curl_result);
+        }
+
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        return response;
+    }
+
+    std::string urlEncode(const std::string& input)
+    {
+        CURL* curl = curl_easy_init();
+
+        if (!curl)
+        {
+            return input;
+        }
+
+        char* escaped = curl_easy_escape(
+            curl,
+            input.c_str(),
+            static_cast<int>(input.size())
+        );
+
+        std::string output = escaped ? std::string(escaped) : input;
+
+        if (escaped)
+        {
+            curl_free(escaped);
+        }
+
+        curl_easy_cleanup(curl);
+        return output;
+    }
+
+    bool firebaseSignIn()
+    {
+        nlohmann::json auth_body;
+        auth_body["email"] = FIREBASE_DEVICE_EMAIL;
+        auth_body["password"] = FIREBASE_DEVICE_PASSWORD;
+        auth_body["returnSecureToken"] = true;
+
+        std::string url =
+            "https://identitytoolkit.googleapis.com/v1/accounts:"
+            "signInWithPassword?key=" + FIREBASE_WEB_API_KEY;
+
+        HttpResponse response = post(
+            url,
+            auth_body.dump(),
+            "application/json"
+        );
+
+        if (!isSuccess(response.status_code))
+        {
+            std::cerr << "[FIRESTORE] Auth failed HTTP "
+                      << response.status_code << ": "
+                      << shortResponse(response.body) << std::endl;
+            return false;
+        }
+
+        nlohmann::json result =
+            nlohmann::json::parse(response.body, nullptr, false);
+
+        if (result.is_discarded())
+        {
+            std::cerr << "[FIRESTORE] Cannot parse Auth JSON." << std::endl;
+            return false;
+        }
+
+        id_token_ = result.value("idToken", "");
+        refresh_token_ = result.value("refreshToken", "");
+
+        long expires_seconds = 3600;
+
+        try
+        {
+            expires_seconds = std::stol(result.value("expiresIn", "3600"));
+        }
+        catch (...)
+        {
+            expires_seconds = 3600;
+        }
+
+        token_expire_time_ =
+            std::chrono::system_clock::now() +
+            std::chrono::seconds(expires_seconds);
+
+        if (id_token_.empty() || refresh_token_.empty())
+        {
+            std::cerr << "[FIRESTORE] Auth token empty." << std::endl;
+            return false;
+        }
+
+        std::cout << "[FIRESTORE] Firebase Auth OK." << std::endl;
+        return true;
+    }
+
+    bool refreshIdToken()
+    {
+        if (refresh_token_.empty())
+        {
+            return firebaseSignIn();
+        }
+
+        std::string url =
+            "https://securetoken.googleapis.com/v1/token?key=" +
+            FIREBASE_WEB_API_KEY;
+
+        std::string body =
+            "grant_type=refresh_token&refresh_token=" +
+            urlEncode(refresh_token_);
+
+        HttpResponse response = post(
+            url,
+            body,
+            "application/x-www-form-urlencoded"
+        );
+
+        if (!isSuccess(response.status_code))
+        {
+            std::cerr << "[FIRESTORE] Refresh token failed, sign in again."
+                      << std::endl;
+            return firebaseSignIn();
+        }
+
+        nlohmann::json result =
+            nlohmann::json::parse(response.body, nullptr, false);
+
+        if (result.is_discarded())
+        {
+            return firebaseSignIn();
+        }
+
+        id_token_ = result.value("id_token", "");
+        refresh_token_ = result.value("refresh_token", refresh_token_);
+
+        long expires_seconds = 3600;
+
+        try
+        {
+            expires_seconds = std::stol(result.value("expires_in", "3600"));
+        }
+        catch (...)
+        {
+            expires_seconds = 3600;
+        }
+
+        token_expire_time_ =
+            std::chrono::system_clock::now() +
+            std::chrono::seconds(expires_seconds);
+
+        return !id_token_.empty();
+    }
+
+    bool ensureValidIdToken()
+    {
+        if (id_token_.empty())
+        {
+            return firebaseSignIn();
+        }
+
+        auto now = std::chrono::system_clock::now();
+
+        if (now + std::chrono::seconds(90) >= token_expire_time_)
+        {
+            return refreshIdToken();
+        }
+
+        return true;
+    }
+
+    std::string createDocumentId()
+    {
+        auto now = std::chrono::system_clock::now();
+
+        long long millis =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()
+            ).count();
+
+        std::ostringstream output;
+        output << "log_door_01_"
+               << millis << "_"
+               << document_counter_.fetch_add(1);
+
+        return output.str();
+    }
+
+    bool sendToFirestore(const FirestoreLogEvent& event)
+    {
+        // Chặn cứng thêm lần nữa trước khi thực sự gửi HTTPS.
+        if (event.reason != "SPOOF_DETECTED" &&
+            event.reason != "UNKNOWN_FACE")
+        {
+            return false;
+        }
+
+        if (!ensureValidIdToken())
+        {
+            return false;
+        }
+
+        std::string document_id = createDocumentId();
+        std::string document_name =
+            "projects/" + FIREBASE_PROJECT_ID +
+            "/databases/(default)/documents/access_history/" +
+            document_id;
+
+        nlohmann::json fields;
+        fields["userName"]["stringValue"] = "Unknown";
+        fields["method"]["stringValue"] = "face";
+        fields["result"]["stringValue"] = "DENIED";
+        fields["reason"]["stringValue"] = event.reason;
+        fields["image"]["stringValue"] = "NOT_SAVED_IN_DEMO";
+
+        nlohmann::json transform;
+        transform["fieldPath"] = "createdAt";
+        transform["setToServerValue"] = "REQUEST_TIME";
+
+        nlohmann::json write;
+        write["update"]["name"] = document_name;
+        write["update"]["fields"] = fields;
+        write["updateTransforms"] = nlohmann::json::array({transform});
+        write["currentDocument"]["exists"] = false;
+
+        nlohmann::json commit_request;
+        commit_request["writes"] = nlohmann::json::array({write});
+
+        std::string url =
+            "https://firestore.googleapis.com/v1/projects/" +
+            FIREBASE_PROJECT_ID +
+            "/databases/(default)/documents:commit";
+
+        HttpResponse response = post(
+            url,
+            commit_request.dump(),
+            "application/json",
+            id_token_
+        );
+
+        if (response.status_code == 401 && firebaseSignIn())
+        {
+            response = post(
+                url,
+                commit_request.dump(),
+                "application/json",
+                id_token_
+            );
+        }
+
+        if (!isSuccess(response.status_code))
+        {
+            std::cerr << "[FIRESTORE] Write failed HTTP "
+                      << response.status_code << ": "
+                      << shortResponse(response.body) << std::endl;
+            return false;
+        }
+
+        std::cout << "[FIRESTORE] CREATED access_history/"
+                  << document_id
+                  << " | reason=" << event.reason << std::endl;
+        return true;
+    }
+
+    void workerLoop()
+    {
+        while (true)
+        {
+            FirestoreLogEvent event;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+
+                queue_cv_.wait(
+                    lock,
+                    [this]()
+                    {
+                        return !running_.load() || !event_queue_.empty();
+                    }
+                );
+
+                if (!running_.load() && event_queue_.empty())
+                {
+                    break;
+                }
+
+                if (event_queue_.empty())
+                {
+                    continue;
+                }
+
+                event = event_queue_.front();
+                event_queue_.pop_front();
+            }
+
+            bool sent = false;
+
+            for (int attempt = 1; attempt <= 3 && !sent; attempt++)
+            {
+                sent = sendToFirestore(event);
+
+                if (!sent && attempt < 3)
+                {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(attempt * 500)
+                    );
+                }
+            }
+
+            if (!sent)
+            {
+                std::cerr << "[FIRESTORE] Drop log after retry: "
+                          << event.reason << std::endl;
+            }
+        }
+    }
+
+private:
+    std::atomic<bool> enabled_;
+    std::atomic<bool> running_;
+    bool curl_initialized_;
+
+    std::thread worker_thread_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::deque<FirestoreLogEvent> event_queue_;
+
+    std::string id_token_;
+    std::string refresh_token_;
+    std::chrono::system_clock::time_point token_expire_time_;
+    std::atomic<std::uint64_t> document_counter_;
+};
+
+// ====================== PI FIRESTORE EVENT GATE ======================
+//
+// Chỉ gửi một log cho một lần đối tượng đứng trước camera.
+// Reset sự kiện sau khi:
+//   - không còn mặt trong khung hình; hoặc
+//   - nhận diện được người hợp lệ.
+//
+// Nếu kết quả liveness/recognition dao động trong lúc cùng một đối tượng vẫn
+// đứng trước camera, code không tạo thêm log thứ hai sau khi đã gửi.
+//
+class PiDeniedEventGate
+{
+public:
+    explicit PiDeniedEventGate(double required_hold_seconds)
+        : required_hold_seconds_(std::max(0.1, required_hold_seconds)),
+          fake_timer_started_(false),
+          unknown_timer_started_(false),
+          log_already_sent_(false)
+    {
+    }
+
+    void reset()
+    {
+        fake_timer_started_ = false;
+        unknown_timer_started_ = false;
+        log_already_sent_ = false;
+    }
+
+    void observe(
+        const CachedResult& cached,
+        bool suppress_logging,
+        FirestoreLogger& logger
+    )
+    {
+        /*
+         * Reset toàn bộ một lần truy cập khi:
+         * - đang ADD USER;
+         * - không còn mặt trong camera;
+         * - trạng thái hoàn toàn hợp lệ: REAL + Known.
+         */
+        if (suppress_logging ||
+            !cached.has_face ||
+            (cached.is_real && cached.match.known))
+        {
+            reset();
+            return;
+        }
+
+        /*
+         * Đã ghi một log cho lần đối tượng đang đứng trước camera thì không
+         * ghi tiếp, cho đến khi reset() bởi no-face / REAL+Known / ADD USER.
+         */
+        if (log_already_sent_)
+        {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        /*
+         * Hai điều kiện fail độc lập:
+         *
+         * - fake_active không phụ thuộc name có Known hay Unknown.
+         * - unknown_active không phụ thuộc liveness đang REAL hay FAKE.
+         *
+         * Vì vậy REAL/FAKE nhảy không làm reset timer UNKNOWN,
+         * và Known/Unknown nhảy không làm reset timer FAKE.
+         */
+        const bool fake_active = !cached.is_real;
+        const bool unknown_active = !cached.match.known;
+
+        updateTimer(
+            fake_active,
+            fake_timer_started_,
+            fake_start_time_,
+            "SPOOF_DETECTED",
+            now
+        );
+
+        updateTimer(
+            unknown_active,
+            unknown_timer_started_,
+            unknown_start_time_,
+            "UNKNOWN_FACE",
+            now
+        );
+
+        const double fake_held_seconds = elapsedTimerSeconds(
+            fake_timer_started_,
+            fake_start_time_,
+            now
+        );
+
+        const double unknown_held_seconds = elapsedTimerSeconds(
+            unknown_timer_started_,
+            unknown_start_time_,
+            now
+        );
+
+        std::string reason_to_log;
+        double held_seconds = 0.0;
+
+        /*
+         * Nếu cả hai timer cùng đạt ngưỡng trong lần kiểm tra này,
+         * ưu tiên SPOOF_DETECTED vì phát hiện giả mạo nghiêm trọng hơn.
+         */
+        if (fake_active &&
+            fake_timer_started_ &&
+            fake_held_seconds >= required_hold_seconds_)
+        {
+            reason_to_log = "SPOOF_DETECTED";
+            held_seconds = fake_held_seconds;
+        }
+        else if (unknown_active &&
+                 unknown_timer_started_ &&
+                 unknown_held_seconds >= required_hold_seconds_)
+        {
+            reason_to_log = "UNKNOWN_FACE";
+            held_seconds = unknown_held_seconds;
+        }
+
+        if (reason_to_log.empty())
+        {
+            return;
+        }
+
+        if (logger.enqueueDeniedEvent(reason_to_log))
+        {
+            std::cout << "[ACCESS] Condition held for "
+                      << fmtDouble(held_seconds, 1)
+                      << "s. Queue Firebase log: "
+                      << reason_to_log << std::endl;
+
+            log_already_sent_ = true;
+        }
+    }
+
+private:
+    void updateTimer(
+        bool condition_active,
+        bool& timer_started,
+        std::chrono::steady_clock::time_point& start_time,
+        const std::string& reason,
+        const std::chrono::steady_clock::time_point& now
+    )
+    {
+        if (condition_active)
+        {
+            if (!timer_started)
+            {
+                timer_started = true;
+                start_time = now;
+
+                std::cout << "[ACCESS] Start independent hold timer: "
+                          << reason
+                          << " | required="
+                          << fmtDouble(required_hold_seconds_, 1)
+                          << "s" << std::endl;
+            }
+
+            return;
+        }
+
+        /*
+         * Chỉ reset timer của điều kiện vừa hết.
+         * Không đụng vào timer của điều kiện fail còn lại.
+         */
+        timer_started = false;
+    }
+
+    static double elapsedTimerSeconds(
+        bool timer_started,
+        const std::chrono::steady_clock::time_point& start_time,
+        const std::chrono::steady_clock::time_point& now
+    )
+    {
+        if (!timer_started)
+        {
+            return 0.0;
+        }
+
+        return std::chrono::duration<double>(now - start_time).count();
+    }
+
+private:
+    double required_hold_seconds_;
+
+    bool fake_timer_started_;
+    bool unknown_timer_started_;
+    bool log_already_sent_;
+
+    std::chrono::steady_clock::time_point fake_start_time_;
+    std::chrono::steady_clock::time_point unknown_start_time_;
+};
+
 
 // ====================== SIMPLE GUI BUTTON STATE ======================
 
@@ -3079,7 +2601,12 @@ static Bbox scaleBbox(const Bbox& box, float sx, float sy)
 
 LiveFaceBox Bbox2LiveFaceBox(const Bbox& box)
 {
-    LiveFaceBox live_box = {box.x1, box.y1, box.x2, box.y2};
+    LiveFaceBox live_box = {
+        static_cast<float>(box.x1),
+        static_cast<float>(box.y1),
+        static_cast<float>(box.x2),
+        static_cast<float>(box.y2)
+    };
     return live_box;
 }
 
@@ -4040,6 +3567,24 @@ int MTCNNDetection()
     AddUserState add_state;
     PerfStats perf;
 
+    FirestoreLogger firestore_logger;
+    PiDeniedEventGate firestore_event_gate(
+        FIRESTORE_DENIED_HOLD_SECONDS
+    );
+
+    if (ENABLE_FIRESTORE_LOG && !firestore_logger.start())
+    {
+        std::cerr << "[FIRESTORE] Vision still runs, but cloud logging is OFF."
+                  << std::endl;
+    }
+    else if (ENABLE_FIRESTORE_LOG)
+    {
+        std::cout << "[FIRESTORE] Independent denied timers enabled: "
+                  << "FAKE or UNKNOWN held for "
+                  << fmtDouble(FIRESTORE_DENIED_HOLD_SECONDS, 1)
+                  << " seconds will create one log." << std::endl;
+    }
+
     int frame_count = 0;
 
     // FPS thực:
@@ -4076,6 +3621,9 @@ int MTCNNDetection()
             (frame_count % PROCESS_EVERY_N_FRAMES == 0) ||
             (frame_count == 1) ||
             add_state.window_open;
+
+        bool has_new_inference_result = false;
+        bool add_user_was_open_for_inference = add_state.window_open;
 
         if (should_process)
         {
@@ -4187,6 +3735,7 @@ int MTCNNDetection()
 
             cached.perf = model_perf;
             perf = model_perf;
+            has_new_inference_result = true;
         }
 
         if (cached.has_face)
@@ -4321,6 +3870,20 @@ int MTCNNDetection()
             }
         }
 
+        if (has_new_inference_result &&
+            ENABLE_FIRESTORE_LOG &&
+            firestore_logger.isEnabled())
+        {
+            bool suppress_firestore_logging =
+                add_state.window_open || add_user_was_open_for_inference;
+
+            firestore_event_gate.observe(
+                cached,
+                suppress_firestore_logging,
+                firestore_logger
+            );
+        }
+
         if (frame_count % LOG_EVERY_N_FRAMES == 0)
         {
             std::cout << "[FRAME " << frame_count << "] ";
@@ -4370,6 +3933,7 @@ int MTCNNDetection()
     }
 
     cap.close();
+    firestore_logger.stop();
     cv::destroyAllWindows();
 
     std::cout << "[INFO] CSI camera stopped." << std::endl;
