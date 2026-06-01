@@ -1327,6 +1327,11 @@ static const std::string FIREBASE_DEVICE_PASSWORD =
 //
 static const double FIRESTORE_DENIED_HOLD_SECONDS = 5.0;
 
+// Nếu một phiên truy cập vẫn luôn FAIL liên tục đủ 30 giây mà không reset,
+// mở chu kỳ cảnh báo mới. Ví dụ: log ở giây 5, cho phép log tiếp ở giây 35,
+// rồi giây 65 nếu người/ảnh giả vẫn đứng trước camera và tiếp tục fail.
+static const double FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS = 30.0;
+
 // Nếu mạng lỗi lâu, chỉ giữ tối đa 32 log đang chờ trong RAM.
 static const std::size_t FIRESTORE_MAX_QUEUE_SIZE = 32;
 
@@ -1965,19 +1970,27 @@ private:
 class PiDeniedEventGate
 {
 public:
-    explicit PiDeniedEventGate(double required_hold_seconds)
+    PiDeniedEventGate(
+        double required_hold_seconds,
+        double continuous_fail_cycle_seconds
+    )
         : required_hold_seconds_(std::max(0.1, required_hold_seconds)),
+          continuous_fail_cycle_seconds_(
+              std::max(required_hold_seconds_, continuous_fail_cycle_seconds)
+          ),
+          cycle_started_(false),
           fake_timer_started_(false),
           unknown_timer_started_(false),
-          log_already_sent_(false)
+          log_already_sent_in_cycle_(false)
     {
     }
 
     void reset()
     {
+        cycle_started_ = false;
         fake_timer_started_ = false;
         unknown_timer_started_ = false;
-        log_already_sent_ = false;
+        log_already_sent_in_cycle_ = false;
     }
 
     void observe(
@@ -1987,43 +2000,73 @@ public:
     )
     {
         /*
-         * Reset toàn bộ một lần truy cập khi:
-         * - đang ADD USER;
-         * - không còn mặt trong camera;
-         * - trạng thái hoàn toàn hợp lệ: REAL + Known.
+         * Một "phiên fail liên tục" chỉ tồn tại khi vẫn thấy mặt và cửa
+         * chưa được chấp nhận mở:
+         *   - UNKNOWN_FACE: !cached.match.known
+         *   - SPOOF_DETECTED: !cached.is_real
+         *
+         * Reset toàn bộ khi:
+         *   - đang ADD USER;
+         *   - không còn mặt;
+         *   - REAL + Known, tức truy cập khuôn mặt hợp lệ.
          */
-        if (suppress_logging ||
-            !cached.has_face ||
-            (cached.is_real && cached.match.known))
+        const bool access_is_valid =
+            cached.has_face &&
+            cached.is_real &&
+            cached.match.known;
+
+        const bool denied_is_active =
+            cached.has_face &&
+            (!cached.is_real || !cached.match.known);
+
+        if (suppress_logging || !denied_is_active || access_is_valid)
         {
             reset();
-            return;
-        }
-
-        /*
-         * Đã ghi một log cho lần đối tượng đang đứng trước camera thì không
-         * ghi tiếp, cho đến khi reset() bởi no-face / REAL+Known / ADD USER.
-         */
-        if (log_already_sent_)
-        {
             return;
         }
 
         const auto now = std::chrono::steady_clock::now();
 
         /*
-         * Hai điều kiện fail độc lập:
-         *
-         * - fake_active không phụ thuộc name có Known hay Unknown.
-         * - unknown_active không phụ thuộc liveness đang REAL hay FAKE.
-         *
-         * Vì vậy REAL/FAKE nhảy không làm reset timer UNKNOWN,
-         * và Known/Unknown nhảy không làm reset timer FAKE.
+         * Chu kỳ fail chung:
+         * - Bắt đầu ngay từ inference fail đầu tiên.
+         * - UNKNOWN/FAKE thay đổi qua lại KHÔNG reset chu kỳ 30 giây,
+         *   miễn là vẫn đang fail.
+         * - Đủ 30 giây fail liên tục thì mở một chu kỳ log mới.
+         */
+        if (!cycle_started_)
+        {
+            startNewCycle(now, false);
+        }
+        else
+        {
+            const double cycle_seconds =
+                std::chrono::duration<double>(now - cycle_start_time_).count();
+
+            if (cycle_seconds >= continuous_fail_cycle_seconds_)
+            {
+                startNewCycle(now, true);
+            }
+        }
+
+        /*
+         * Nếu chu kỳ hiện tại đã ghi một log, vẫn theo dõi phiên fail 30 giây
+         * ở phần trên, nhưng chưa xét log mới cho đến khi sang chu kỳ tiếp.
+         */
+        if (log_already_sent_in_cycle_)
+        {
+            return;
+        }
+
+        /*
+         * Hai timer reason chạy độc lập trong MỖI chu kỳ 30 giây:
+         * - REAL/FAKE nhảy không reset UNKNOWN timer.
+         * - Known/Unknown nhảy không reset FAKE timer.
          */
         const bool fake_active = !cached.is_real;
         const bool unknown_active = !cached.match.known;
 
-        updateTimer(
+        updateConditionTimer(
             fake_active,
             fake_timer_started_,
             fake_start_time_,
@@ -2031,7 +2074,7 @@ public:
             now
         );
 
-        updateTimer(
+        updateConditionTimer(
             unknown_active,
             unknown_timer_started_,
             unknown_start_time_,
@@ -2039,13 +2082,13 @@ public:
             now
         );
 
-        const double fake_held_seconds = elapsedTimerSeconds(
+        const double fake_seconds = elapsedTimerSeconds(
             fake_timer_started_,
             fake_start_time_,
             now
         );
 
-        const double unknown_held_seconds = elapsedTimerSeconds(
+        const double unknown_seconds = elapsedTimerSeconds(
             unknown_timer_started_,
             unknown_start_time_,
             now
@@ -2055,22 +2098,22 @@ public:
         double held_seconds = 0.0;
 
         /*
-         * Nếu cả hai timer cùng đạt ngưỡng trong lần kiểm tra này,
-         * ưu tiên SPOOF_DETECTED vì phát hiện giả mạo nghiêm trọng hơn.
+         * Nếu cả hai fail cùng đạt 5 giây tại một inference, ưu tiên
+         * SPOOF_DETECTED vì đây là hành vi giả mạo.
          */
         if (fake_active &&
             fake_timer_started_ &&
-            fake_held_seconds >= required_hold_seconds_)
+            fake_seconds >= required_hold_seconds_)
         {
             reason_to_log = "SPOOF_DETECTED";
-            held_seconds = fake_held_seconds;
+            held_seconds = fake_seconds;
         }
         else if (unknown_active &&
                  unknown_timer_started_ &&
-                 unknown_held_seconds >= required_hold_seconds_)
+                 unknown_seconds >= required_hold_seconds_)
         {
             reason_to_log = "UNKNOWN_FACE";
-            held_seconds = unknown_held_seconds;
+            held_seconds = unknown_seconds;
         }
 
         if (reason_to_log.empty())
@@ -2082,15 +2125,41 @@ public:
         {
             std::cout << "[ACCESS] Condition held for "
                       << fmtDouble(held_seconds, 1)
-                      << "s. Queue Firebase log: "
+                      << "s in current fail cycle. Queue Firebase log: "
                       << reason_to_log << std::endl;
 
-            log_already_sent_ = true;
+            log_already_sent_in_cycle_ = true;
         }
     }
 
 private:
-    void updateTimer(
+    void startNewCycle(
+        const std::chrono::steady_clock::time_point& now,
+        bool is_rollover
+    )
+    {
+        cycle_started_ = true;
+        cycle_start_time_ = now;
+
+        fake_timer_started_ = false;
+        unknown_timer_started_ = false;
+        log_already_sent_in_cycle_ = false;
+
+        if (is_rollover)
+        {
+            std::cout << "[ACCESS] Continuous fail reached "
+                      << fmtDouble(continuous_fail_cycle_seconds_, 1)
+                      << "s. Start a new logging cycle." << std::endl;
+        }
+        else
+        {
+            std::cout << "[ACCESS] Start continuous fail cycle. Relog interval="
+                      << fmtDouble(continuous_fail_cycle_seconds_, 1)
+                      << "s" << std::endl;
+        }
+    }
+
+    void updateConditionTimer(
         bool condition_active,
         bool& timer_started,
         std::chrono::steady_clock::time_point& start_time,
@@ -2115,10 +2184,7 @@ private:
             return;
         }
 
-        /*
-         * Chỉ reset timer của điều kiện vừa hết.
-         * Không đụng vào timer của điều kiện fail còn lại.
-         */
+        // Chỉ điều kiện này mất liên tục mới reset timer của chính nó.
         timer_started = false;
     }
 
@@ -2138,11 +2204,14 @@ private:
 
 private:
     double required_hold_seconds_;
+    double continuous_fail_cycle_seconds_;
 
+    bool cycle_started_;
     bool fake_timer_started_;
     bool unknown_timer_started_;
-    bool log_already_sent_;
+    bool log_already_sent_in_cycle_;
 
+    std::chrono::steady_clock::time_point cycle_start_time_;
     std::chrono::steady_clock::time_point fake_start_time_;
     std::chrono::steady_clock::time_point unknown_start_time_;
 };
@@ -3569,7 +3638,8 @@ int MTCNNDetection()
 
     FirestoreLogger firestore_logger;
     PiDeniedEventGate firestore_event_gate(
-        FIRESTORE_DENIED_HOLD_SECONDS
+        FIRESTORE_DENIED_HOLD_SECONDS,
+        FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS
     );
 
     if (ENABLE_FIRESTORE_LOG && !firestore_logger.start())
@@ -3583,6 +3653,9 @@ int MTCNNDetection()
                   << "FAKE or UNKNOWN held for "
                   << fmtDouble(FIRESTORE_DENIED_HOLD_SECONDS, 1)
                   << " seconds will create one log." << std::endl;
+        std::cout << "[FIRESTORE] Continuous failure relog cycle: "
+                  << fmtDouble(FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS, 1)
+                  << " seconds." << std::endl;
     }
 
     int frame_count = 0;
