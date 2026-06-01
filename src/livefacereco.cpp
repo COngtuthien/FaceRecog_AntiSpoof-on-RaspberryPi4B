@@ -1205,6 +1205,7 @@
 // - Terminal log shows: name, real/fake, live score, recog score, FPS, loop time,
 //   total inference time, and per-model AI time: detect / recognition / anti-spoof
 // - Gamma Correction + Laplacian Sharpening are applied only for face recognition branch
+// - Unlock: REAL + Known 2s -> send '1'; wait 5s -> count 2s again to resend '1'
 // - Press q to quit main window
 //
 
@@ -1216,6 +1217,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cerrno>
+#include <ctime>
 #include <deque>
 #include <cmath>
 #include <cctype>
@@ -1224,13 +1227,17 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <fcntl.h>
 #include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <thread>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include <curl/curl.h>
@@ -1259,6 +1266,13 @@ using namespace cv;
 // ====================================================
 
 static const std::string USER_DIR = project_path + "/users";
+
+// Folder lưu ảnh minh chứng mỗi lần Pi tạo sự kiện log Firestore.
+// Thư mục này nằm ngang hàng với users/:
+//   <project_path>/users
+//   <project_path>/access_log_images
+static const std::string ACCESS_LOG_IMAGE_DIR =
+    project_path + "/access_log_images";
 
 // Camera CSI OV5647 capture size.
 static const int CAMERA_WIDTH  = 640;
@@ -1334,6 +1348,31 @@ static const double FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS = 30.0;
 
 // Nếu mạng lỗi lâu, chỉ giữ tối đa 32 log đang chờ trong RAM.
 static const std::size_t FIRESTORE_MAX_QUEUE_SIZE = 32;
+
+// Ảnh log được lưu cục bộ trong ACCESS_LOG_IMAGE_DIR.
+// Trường "image" gửi lên Firestore vẫn giữ "NOT_SAVED_IN_DEMO"
+// để khớp Rules hiện tại; ảnh cục bộ không phải Firebase Storage.
+static const bool SAVE_LOCAL_FIRESTORE_SNAPSHOT = true;
+
+// ====================== ESP32 UART UNLOCK CONFIG ======================
+//
+// Giữ đúng cơ chế đầu ra của code FaceNet:
+//   /dev/serial0, 9600 baud, gửi ASCII '1' để mở và '0' để đóng.
+//
+// Cơ chế unlock:
+//   1. REAL FACE + Known liên tục đủ 2 giây -> gửi ASCII '1'.
+//   2. Sau khi đã gửi '1', chờ 5 giây.
+//   3. Nếu khuôn mặt vẫn hợp lệ, bắt đầu đếm lại 2 giây và gửi '1' lần tiếp.
+//   4. Nếu mất hợp lệ ở bất kỳ thời điểm nào -> gửi ASCII '0' và reset.
+//
+// Lưu ý: lần gửi '1' tiếp theo dùng force=true vì đây là tín hiệu trigger
+// mở khóa mới, kể cả trạng thái UART trước đó vẫn đang là OPEN.
+//
+static const bool ENABLE_ESP32_UNLOCK_SIGNAL = true;
+static const std::string ESP32_SERIAL_PORT = "/dev/serial0";
+static const int ESP32_SERIAL_BAUD = 9600;
+static const double VALID_FACE_UNLOCK_HOLD_SECONDS = 2.0;
+static const double UNLOCK_RECHECK_DELAY_SECONDS = 5.0;
 
 // ====================================================
 
@@ -1433,7 +1472,16 @@ static std::string fmtDouble(double v, int precision);
 //
 struct FirestoreLogEvent
 {
+    std::string document_id;
+    std::string user_name = "Unknown";
+    std::string method = "face";
+    std::string result = "DENIED";
     std::string reason;
+    std::string image_field = "NOT_SAVED_IN_DEMO";
+    std::string captured_at_local;
+    double live_score = 0.0;
+    double recognition_score = -1.0;
+    cv::Mat snapshot_frame;
 };
 
 class FirestoreLogger
@@ -1509,19 +1557,35 @@ public:
         return enabled_.load();
     }
 
-    bool enqueueDeniedEvent(const std::string& reason)
+    bool enqueueDeniedEvent(
+        const std::string& reason,
+        const cv::Mat& snapshot_frame,
+        const CachedResult& cached
+    )
     {
         if (!enabled_.load())
         {
             return false;
         }
 
-        // Chặn cứng ở phía Pi: không thể gửi reason khác.
+        // Chặn cứng phía Pi: không gửi event khác hai loại fail khuôn mặt.
         if (reason != "SPOOF_DETECTED" && reason != "UNKNOWN_FACE")
         {
             std::cerr << "[FIRESTORE] Block invalid Pi event: "
                       << reason << std::endl;
             return false;
+        }
+
+        FirestoreLogEvent event;
+        event.document_id = createDocumentId();
+        event.reason = reason;
+        event.captured_at_local = createLocalTimestamp();
+        event.live_score = cached.live_score;
+        event.recognition_score = cached.match.score;
+
+        if (!snapshot_frame.empty())
+        {
+            event.snapshot_frame = snapshot_frame.clone();
         }
 
         {
@@ -1534,7 +1598,7 @@ public:
                           << std::endl;
             }
 
-            event_queue_.push_back({reason});
+            event_queue_.push_back(std::move(event));
         }
 
         queue_cv_.notify_one();
@@ -1812,6 +1876,112 @@ private:
         return output.str();
     }
 
+    static std::string createLocalTimestamp()
+    {
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+
+        std::tm time_info;
+        localtime_r(&now_time, &time_info);
+
+        char output[32];
+        std::strftime(
+            output,
+            sizeof(output),
+            "%Y-%m-%d %H:%M:%S",
+            &time_info
+        );
+
+        return std::string(output);
+    }
+
+    bool saveAnnotatedSnapshot(const FirestoreLogEvent& event)
+    {
+        if (!SAVE_LOCAL_FIRESTORE_SNAPSHOT)
+        {
+            return true;
+        }
+
+        if (event.snapshot_frame.empty())
+        {
+            std::cerr << "[SNAPSHOT] Skip empty snapshot for "
+                      << event.document_id << std::endl;
+            return false;
+        }
+
+        if (::mkdir(ACCESS_LOG_IMAGE_DIR.c_str(), 0755) != 0 &&
+            errno != EEXIST)
+        {
+            std::cerr << "[SNAPSHOT] Cannot create folder: "
+                      << ACCESS_LOG_IMAGE_DIR << std::endl;
+            return false;
+        }
+
+        cv::Mat saved_frame = event.snapshot_frame.clone();
+
+        int panel_x = 10;
+        int panel_w = std::min(saved_frame.cols - 20, 610);
+        int panel_h = 206;
+        int panel_y = std::max(10, saved_frame.rows - panel_h - 10);
+
+        if (panel_w > 0)
+        {
+            cv::rectangle(
+                saved_frame,
+                cv::Rect(panel_x, panel_y, panel_w, panel_h),
+                cv::Scalar(0, 0, 0),
+                cv::FILLED
+            );
+
+            std::vector<std::string> lines = {
+                "FIRESTORE ACCESS LOG SNAPSHOT",
+                "document: " + event.document_id,
+                "userName: " + event.user_name + " | method: " + event.method,
+                "result: " + event.result + " | reason: " + event.reason,
+                "createdAt: SERVER_TIMESTAMP",
+                "capturedAtLocal: " + event.captured_at_local,
+                "image: " + event.image_field,
+                "live_score: " + fmtDouble(event.live_score, 3) +
+                    " | recog_score: " + fmtDouble(event.recognition_score, 3)
+            };
+
+            int line_y = panel_y + 25;
+            for (std::size_t i = 0; i < lines.size(); ++i)
+            {
+                cv::Scalar color =
+                    (i == 0) ? cv::Scalar(0, 255, 255) :
+                    ((event.reason == "SPOOF_DETECTED" && i == 3)
+                        ? cv::Scalar(0, 0, 255)
+                        : cv::Scalar(255, 255, 255));
+
+                cv::putText(
+                    saved_frame,
+                    lines[i],
+                    cv::Point(panel_x + 10, line_y),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.46,
+                    color,
+                    1
+                );
+                line_y += 23;
+            }
+        }
+
+        const std::string save_path =
+            ACCESS_LOG_IMAGE_DIR + "/" +
+            event.document_id + "_" + event.reason + ".jpg";
+
+        if (!cv::imwrite(save_path, saved_frame))
+        {
+            std::cerr << "[SNAPSHOT] Cannot save image: "
+                      << save_path << std::endl;
+            return false;
+        }
+
+        std::cout << "[SNAPSHOT] SAVED " << save_path << std::endl;
+        return true;
+    }
+
     bool sendToFirestore(const FirestoreLogEvent& event)
     {
         // Chặn cứng thêm lần nữa trước khi thực sự gửi HTTPS.
@@ -1826,18 +1996,17 @@ private:
             return false;
         }
 
-        std::string document_id = createDocumentId();
         std::string document_name =
             "projects/" + FIREBASE_PROJECT_ID +
             "/databases/(default)/documents/access_history/" +
-            document_id;
+            event.document_id;
 
         nlohmann::json fields;
-        fields["userName"]["stringValue"] = "Unknown";
-        fields["method"]["stringValue"] = "face";
-        fields["result"]["stringValue"] = "DENIED";
+        fields["userName"]["stringValue"] = event.user_name;
+        fields["method"]["stringValue"] = event.method;
+        fields["result"]["stringValue"] = event.result;
         fields["reason"]["stringValue"] = event.reason;
-        fields["image"]["stringValue"] = "NOT_SAVED_IN_DEMO";
+        fields["image"]["stringValue"] = event.image_field;
 
         nlohmann::json transform;
         transform["fieldPath"] = "createdAt";
@@ -1883,7 +2052,7 @@ private:
         }
 
         std::cout << "[FIRESTORE] CREATED access_history/"
-                  << document_id
+                  << event.document_id
                   << " | reason=" << event.reason << std::endl;
         return true;
     }
@@ -1918,6 +2087,10 @@ private:
                 event = event_queue_.front();
                 event_queue_.pop_front();
             }
+
+            // Lưu ảnh cục bộ ở background thread ngay khi event Firestore được tạo.
+            // Nếu mạng lỗi, ảnh bằng chứng vẫn còn trên Raspberry Pi.
+            saveAnnotatedSnapshot(event);
 
             bool sent = false;
 
@@ -1995,6 +2168,7 @@ public:
 
     void observe(
         const CachedResult& cached,
+        const cv::Mat& snapshot_frame,
         bool suppress_logging,
         FirestoreLogger& logger
     )
@@ -2121,7 +2295,7 @@ public:
             return;
         }
 
-        if (logger.enqueueDeniedEvent(reason_to_log))
+        if (logger.enqueueDeniedEvent(reason_to_log, snapshot_frame, cached))
         {
             std::cout << "[ACCESS] Condition held for "
                       << fmtDouble(held_seconds, 1)
@@ -3552,6 +3726,320 @@ static bool saveAddUserBatch(
     return false;
 }
 
+// ====================== ESP32 UART + UNLOCK GATE ======================
+//
+// Cơ chế tương đương code FaceNet Python:
+// - UART /dev/serial0, baud 9600.
+// - Gửi ASCII '1' khi REAL FACE + Known liên tục đủ 2 giây.
+// - Sau khi gửi unlock, chờ 5 giây rồi mới bắt đầu đếm hợp lệ lại từ đầu.
+// - Nếu tiếp tục REAL FACE + Known đủ 2 giây sau thời gian chờ,
+//   gửi lại ASCII '1' để kích hoạt unlock lần mới.
+// - Gửi ASCII '0' khi trạng thái không còn hợp lệ hoặc khi thoát.
+//
+class Esp32SerialController
+{
+public:
+    Esp32SerialController(
+        const std::string& device_path,
+        int baud_rate
+    )
+        : device_path_(device_path),
+          baud_rate_(baud_rate),
+          fd_(-1),
+          last_state_(-1)
+    {
+    }
+
+    ~Esp32SerialController()
+    {
+        closePort();
+    }
+
+    bool openPort()
+    {
+        fd_ = ::open(
+            device_path_.c_str(),
+            O_RDWR | O_NOCTTY | O_SYNC
+        );
+
+        if (fd_ < 0)
+        {
+            std::cerr << "[UART] Cannot open " << device_path_
+                      << ": errno=" << errno << std::endl;
+            return false;
+        }
+
+        struct termios tty;
+        std::memset(&tty, 0, sizeof(tty));
+
+        if (tcgetattr(fd_, &tty) != 0)
+        {
+            std::cerr << "[UART] tcgetattr failed: errno="
+                      << errno << std::endl;
+            closePort();
+            return false;
+        }
+
+        speed_t baud_flag = B9600;
+
+        if (baud_rate_ != 9600)
+        {
+            std::cerr << "[UART] Unsupported baud in this demo: "
+                      << baud_rate_ << ". Use 9600." << std::endl;
+            closePort();
+            return false;
+        }
+
+        cfsetospeed(&tty, baud_flag);
+        cfsetispeed(&tty, baud_flag);
+
+        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+        tty.c_iflag &= ~IGNBRK;
+        tty.c_lflag = 0;
+        tty.c_oflag = 0;
+        tty.c_cc[VMIN] = 0;
+        tty.c_cc[VTIME] = 10;
+
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
+        tty.c_cflag |= (CLOCAL | CREAD);
+        tty.c_cflag &= ~(PARENB | PARODD);
+        tty.c_cflag &= ~CSTOPB;
+#ifdef CRTSCTS
+        tty.c_cflag &= ~CRTSCTS;
+#endif
+
+        if (tcsetattr(fd_, TCSANOW, &tty) != 0)
+        {
+            std::cerr << "[UART] tcsetattr failed: errno="
+                      << errno << std::endl;
+            closePort();
+            return false;
+        }
+
+        tcflush(fd_, TCIOFLUSH);
+
+        std::cout << "[UART] Connected to ESP32: "
+                  << device_path_ << " @ " << baud_rate_ << " baud."
+                  << std::endl;
+
+        // Khởi động an toàn: báo đóng khóa trước.
+        sendState(0, true);
+        return true;
+    }
+
+    bool isOpened() const
+    {
+        return fd_ >= 0;
+    }
+
+    bool sendState(int state, bool force = false)
+    {
+        if (!isOpened())
+        {
+            return false;
+        }
+
+        const int normalized_state = (state == 1) ? 1 : 0;
+
+        /*
+         * Bình thường không gửi trùng trạng thái để tránh spam UART.
+         * Với tín hiệu unlock lặp lại, ValidFaceUnlockGate gọi force=true
+         * vì mỗi byte '1' là một lần trigger mở khóa mới cho ESP32.
+         */
+        if (!force && normalized_state == last_state_)
+        {
+            return true;
+        }
+
+        const char data = (normalized_state == 1) ? '1' : '0';
+        const ssize_t written = ::write(fd_, &data, 1);
+
+        if (written != 1)
+        {
+            std::cerr << "[UART] Write failed: errno="
+                      << errno << std::endl;
+            return false;
+        }
+
+        tcdrain(fd_);
+        last_state_ = normalized_state;
+
+        std::cout << "[UART] >>> "
+                  << ((normalized_state == 1) ? "OPEN" : "CLOSE")
+                  << " (sent '" << data << "')"
+                  << (force ? " [force]" : "")
+                  << std::endl;
+
+        return true;
+    }
+
+    void closePort()
+    {
+        if (fd_ >= 0)
+        {
+            sendState(0, true);
+            ::close(fd_);
+            fd_ = -1;
+        }
+
+        last_state_ = -1;
+    }
+
+private:
+    std::string device_path_;
+    int baud_rate_;
+    int fd_;
+    int last_state_;
+};
+
+class ValidFaceUnlockGate
+{
+public:
+    ValidFaceUnlockGate(
+        double required_valid_seconds,
+        double recheck_delay_seconds
+    )
+        : required_valid_seconds_(std::max(0.1, required_valid_seconds)),
+          recheck_delay_seconds_(std::max(0.0, recheck_delay_seconds)),
+          valid_timer_started_(false),
+          waiting_for_recheck_(false),
+          unlock_sent_in_session_(false)
+    {
+    }
+
+    void observe(
+        const CachedResult& cached,
+        bool suppress_unlock,
+        Esp32SerialController& serial
+    )
+    {
+        const bool valid_access =
+            !suppress_unlock &&
+            cached.has_face &&
+            cached.is_real &&
+            cached.match.known;
+
+        /*
+         * Chỉ cần mất một trong ba điều kiện REAL + FACE + Known:
+         * - hủy thời gian chờ/đếm hiện tại;
+         * - nếu phiên này từng mở khóa thì gửi '0';
+         * - lần hợp lệ tiếp theo sẽ đếm lại từ đầu.
+         */
+        if (!valid_access)
+        {
+            resetAndLock(serial);
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        /*
+         * Sau khi đã gửi unlock, không đếm tiếp ngay.
+         * Đợi đủ 5 giây rồi mới bắt đầu một bộ đếm hợp lệ 2 giây mới.
+         */
+        if (waiting_for_recheck_)
+        {
+            const double waited_seconds =
+                std::chrono::duration<double>(
+                    now - last_unlock_time_
+                ).count();
+
+            if (waited_seconds < recheck_delay_seconds_)
+            {
+                return;
+            }
+
+            waiting_for_recheck_ = false;
+            valid_timer_started_ = true;
+            valid_start_time_ = now;
+
+            std::cout << "[UNLOCK] Recheck delay completed after "
+                      << fmtDouble(waited_seconds, 1)
+                      << "s. Start a new valid-face timer for user="
+                      << cached.match.name
+                      << " | required="
+                      << fmtDouble(required_valid_seconds_, 1)
+                      << "s" << std::endl;
+            return;
+        }
+
+        if (!valid_timer_started_)
+        {
+            valid_timer_started_ = true;
+            valid_start_time_ = now;
+
+            std::cout << "[UNLOCK] Start valid-face timer: "
+                      << cached.match.name
+                      << " | required="
+                      << fmtDouble(required_valid_seconds_, 1)
+                      << "s" << std::endl;
+            return;
+        }
+
+        const double valid_seconds =
+            std::chrono::duration<double>(now - valid_start_time_).count();
+
+        if (valid_seconds < required_valid_seconds_)
+        {
+            return;
+        }
+
+        /*
+         * Luôn force gửi byte '1':
+         * Sau lần mở đầu tiên, last_state_ của UART vẫn là OPEN (1).
+         * Nếu không force, sendState() sẽ bỏ qua lần unlock kế tiếp.
+         */
+        if (serial.sendState(1, true))
+        {
+            unlock_sent_in_session_ = true;
+            waiting_for_recheck_ = true;
+            valid_timer_started_ = false;
+            last_unlock_time_ = now;
+
+            std::cout << "[UNLOCK] Access valid for "
+                      << fmtDouble(valid_seconds, 1)
+                      << "s. ESP32 unlock sent for user="
+                      << cached.match.name
+                      << ". Recheck countdown will restart after "
+                      << fmtDouble(recheck_delay_seconds_, 1)
+                      << "s." << std::endl;
+        }
+    }
+
+    void resetAndLock(Esp32SerialController& serial)
+    {
+        valid_timer_started_ = false;
+        waiting_for_recheck_ = false;
+
+        if (unlock_sent_in_session_)
+        {
+            serial.sendState(0);
+        }
+
+        unlock_sent_in_session_ = false;
+    }
+
+    void shutdown(Esp32SerialController& serial)
+    {
+        valid_timer_started_ = false;
+        waiting_for_recheck_ = false;
+        unlock_sent_in_session_ = false;
+        serial.sendState(0, true);
+    }
+
+private:
+    double required_valid_seconds_;
+    double recheck_delay_seconds_;
+
+    bool valid_timer_started_;
+    bool waiting_for_recheck_;
+    bool unlock_sent_in_session_;
+
+    std::chrono::steady_clock::time_point valid_start_time_;
+    std::chrono::steady_clock::time_point last_unlock_time_;
+};
+
+
 // ====================== MAIN PIPELINE ======================
 
 int MTCNNDetection()
@@ -3590,6 +4078,10 @@ int MTCNNDetection()
               << std::endl;
 
     ensureDir(USER_DIR);
+    ensureDir(ACCESS_LOG_IMAGE_DIR);
+
+    std::cout << "[INFO] LOG IMAGE DIR = "
+              << ACCESS_LOG_IMAGE_DIR << std::endl;
 
     cv::Mat face_landmark_gt_matrix = createFaceLandmarkGTMatrix();
 
@@ -3642,6 +4134,27 @@ int MTCNNDetection()
         FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS
     );
 
+    Esp32SerialController esp32_serial(
+        ESP32_SERIAL_PORT,
+        ESP32_SERIAL_BAUD
+    );
+    ValidFaceUnlockGate valid_face_unlock_gate(
+        VALID_FACE_UNLOCK_HOLD_SECONDS,
+        UNLOCK_RECHECK_DELAY_SECONDS
+    );
+
+    bool esp32_serial_ready = false;
+    if (ENABLE_ESP32_UNLOCK_SIGNAL)
+    {
+        esp32_serial_ready = esp32_serial.openPort();
+
+        if (!esp32_serial_ready)
+        {
+            std::cerr << "[UART] Vision and Firestore continue, "
+                      << "but ESP32 unlock output is OFF." << std::endl;
+        }
+    }
+
     if (ENABLE_FIRESTORE_LOG && !firestore_logger.start())
     {
         std::cerr << "[FIRESTORE] Vision still runs, but cloud logging is OFF."
@@ -3656,6 +4169,16 @@ int MTCNNDetection()
         std::cout << "[FIRESTORE] Continuous failure relog cycle: "
                   << fmtDouble(FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS, 1)
                   << " seconds." << std::endl;
+    }
+
+    if (ENABLE_ESP32_UNLOCK_SIGNAL)
+    {
+        std::cout << "[UNLOCK] Requirement: REAL FACE + Known continuously for "
+                  << fmtDouble(VALID_FACE_UNLOCK_HOLD_SECONDS, 1)
+                  << " seconds -> send ASCII '1'. After each unlock, wait "
+                  << fmtDouble(UNLOCK_RECHECK_DELAY_SECONDS, 1)
+                  << " seconds, then count valid time again for the next unlock."
+                  << std::endl;
     }
 
     int frame_count = 0;
@@ -3944,6 +4467,20 @@ int MTCNNDetection()
         }
 
         if (has_new_inference_result &&
+            ENABLE_ESP32_UNLOCK_SIGNAL &&
+            esp32_serial_ready)
+        {
+            bool suppress_unlock =
+                add_state.window_open || add_user_was_open_for_inference;
+
+            valid_face_unlock_gate.observe(
+                cached,
+                suppress_unlock,
+                esp32_serial
+            );
+        }
+
+        if (has_new_inference_result &&
             ENABLE_FIRESTORE_LOG &&
             firestore_logger.isEnabled())
         {
@@ -3952,6 +4489,7 @@ int MTCNNDetection()
 
             firestore_event_gate.observe(
                 cached,
+                display_frame,
                 suppress_firestore_logging,
                 firestore_logger
             );
@@ -4006,6 +4544,13 @@ int MTCNNDetection()
     }
 
     cap.close();
+
+    if (ENABLE_ESP32_UNLOCK_SIGNAL && esp32_serial_ready)
+    {
+        // closePort() tự gửi ASCII '0' trước khi đóng UART.
+        esp32_serial.closePort();
+    }
+
     firestore_logger.stop();
     cv::destroyAllWindows();
 
