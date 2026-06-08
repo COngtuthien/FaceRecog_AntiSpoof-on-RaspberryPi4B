@@ -1,1196 +1,3 @@
-// //
-// // Optimized Realtime Live Face Recognition GUI for Raspberry Pi 4 + CSI OV5647
-// // - Capture CSI camera using rpicam-vid YUV420 pipe
-// // - Load registered users from users/ folder
-// // - Process inference on resized frame for better FPS
-// // - Run heavy models every N frames and cache result
-// // - Show GUI with FPS, identity, recognition score, liveness score
-// // - Show TRUE FACE / FAKE FACE
-// // - Press q or ESC to quit
-// // - Press s to save current aligned face into users/
-// //
-
-// #include <math.h>
-// #include <time.h>
-
-// #include <algorithm>
-// #include <chrono>
-// #include <cstdio>
-// #include <cstdlib>
-// #include <cstring>
-// #include <iomanip>
-// #include <iostream>
-// #include <map>
-// #include <sstream>
-// #include <string>
-// #include <sys/stat.h>
-// #include <sys/types.h>
-// #include <vector>
-
-// #include "livefacereco.hpp"
-// #include "math.hpp"
-// #include "mtcnn_new.h"
-// #include "FacePreprocess.h"
-// // #include "DatasetHandler/image_dataset_handler.hpp"
-
-// #define PI 3.14159265
-
-// using namespace std;
-// using namespace cv;
-
-// // ====================== CONFIG ======================
-// //
-// // Nhớ sửa project_path trong:
-// // 1. src/livefacereco.hpp
-// // 2. src/arcface.h
-// //
-// // Ví dụ:
-// // const string project_path="/home/pi4/LiveFaceReco_RaspberryPi";
-// //
-// // ====================================================
-
-// static const std::string USER_DIR = project_path + "/users";
-
-// // Camera CSI OV5647 capture size.
-// // Nếu muốn nhanh hơn nữa, đổi CAMERA_WIDTH/HEIGHT thành 320x240.
-// // Nếu muốn ảnh đẹp hơn, giữ 640x480 và process ở 320x240.
-// static const int CAMERA_WIDTH  = 640;
-// static const int CAMERA_HEIGHT = 480;
-// static const int CAMERA_FPS    = 30;
-
-// // Kích thước đưa vào MTCNN/ArcFace/Anti-spoof.
-// // Đây là điểm tối ưu chính.
-// static const int PROCESS_WIDTH  = 320;
-// static const int PROCESS_HEIGHT = 240;
-
-// // Chỉ chạy full model mỗi N frame.
-// // 3 là cân bằng tốt cho Pi 4. Muốn nhanh hơn nữa thì để 4 hoặc 5.
-// static const int PROCESS_EVERY_N_FRAMES = 3;
-
-// // Tên dùng khi bấm phím s để lưu mặt mới.
-// static const std::string SAVE_NAME = "Cong";
-
-// // GUI size
-// static const int DISPLAY_WIDTH  = 960;
-// static const int DISPLAY_HEIGHT = 720;
-
-// // Vẽ tất cả bbox detect được
-// static const bool DRAW_ALL_FACES = true;
-
-// // In log terminal mỗi N frame
-// static const int LOG_EVERY_N_FRAMES = 15;
-
-// // rpicam stderr log
-// static const std::string RPICAM_LOG = "/tmp/rpicam_livefacereco.log";
-
-// // ====================================================
-
-// double sum_score, sum_fps, sum_confidence;
-
-// struct MatchResult
-// {
-//     std::string name;
-//     double score;
-//     bool known;
-// };
-
-// struct CachedResult
-// {
-//     bool has_face = false;
-//     bool has_aligned_face = false;
-//     MatchResult match = {"Unknown", -1.0, false};
-//     double live_score = 0.0;
-//     bool is_real = false;
-//     Bbox process_box;
-//     Bbox display_box;
-//     int face_count = 0;
-//     cv::Mat aligned_face;
-//     double last_infer_ms = 0.0;
-// };
-
-// // ====================== RPICAM CAPTURE ======================
-
-// class RpiCamRawCapture
-// {
-// public:
-//     RpiCamRawCapture(int width, int height, int fps)
-//         : width_(width),
-//           height_(height),
-//           fps_(fps),
-//           frame_size_(static_cast<size_t>(width) * height * 3 / 2),
-//           pipe_(nullptr),
-//           opened_(false)
-//     {
-//     }
-
-//     bool open()
-//     {
-//         std::ostringstream cmd;
-
-//         cmd << "rpicam-vid "
-//             << "-t 0 "
-//             << "--width " << width_ << " "
-//             << "--height " << height_ << " "
-//             << "--framerate " << fps_ << " "
-//             << "--codec yuv420 "
-//             << "-n "
-//             << "-o - "
-//             << "2>" << RPICAM_LOG;
-
-//         std::cout << "[INFO] Starting CSI camera with command:" << std::endl;
-//         std::cout << "[INFO] " << cmd.str() << std::endl;
-
-//         pipe_ = popen(cmd.str().c_str(), "r");
-
-//         if (!pipe_)
-//         {
-//             std::cerr << "[ERROR] Cannot start rpicam-vid." << std::endl;
-//             opened_ = false;
-//             return false;
-//         }
-
-//         buffer_.resize(frame_size_);
-//         opened_ = true;
-//         return true;
-//     }
-
-//     bool isOpened() const
-//     {
-//         return opened_ && pipe_ != nullptr;
-//     }
-
-//     cv::Mat getFrame()
-//     {
-//         if (!isOpened())
-//         {
-//             return cv::Mat();
-//         }
-
-//         size_t total_read = 0;
-
-//         while (total_read < frame_size_)
-//         {
-//             size_t n = fread(
-//                 buffer_.data() + total_read,
-//                 1,
-//                 frame_size_ - total_read,
-//                 pipe_
-//             );
-
-//             if (n == 0)
-//             {
-//                 std::cerr << "[ERROR] rpicam stream ended or read failed." << std::endl;
-//                 std::cerr << "[HINT] Check log: cat " << RPICAM_LOG << std::endl;
-//                 close();
-//                 return cv::Mat();
-//             }
-
-//             total_read += n;
-//         }
-
-//         cv::Mat yuv(
-//             height_ * 3 / 2,
-//             width_,
-//             CV_8UC1,
-//             buffer_.data()
-//         );
-
-//         cv::Mat bgr;
-//         cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
-
-//         return bgr.clone();
-//     }
-
-//     void close()
-//     {
-//         if (pipe_)
-//         {
-//             pclose(pipe_);
-//             pipe_ = nullptr;
-//         }
-
-//         opened_ = false;
-//     }
-
-//     ~RpiCamRawCapture()
-//     {
-//         close();
-//     }
-
-// private:
-//     int width_;
-//     int height_;
-//     int fps_;
-//     size_t frame_size_;
-//     FILE* pipe_;
-//     bool opened_;
-//     std::vector<unsigned char> buffer_;
-// };
-
-// // ====================== UTILS ======================
-
-// static void ensureDir(const std::string& path)
-// {
-//     mkdir(path.c_str(), 0755);
-// }
-
-// static double clamp01(double v)
-// {
-//     if (v < 0.0) return 0.0;
-//     if (v > 1.0) return 1.0;
-//     return v;
-// }
-
-// static std::string fmtDouble(double v, int precision = 2)
-// {
-//     std::ostringstream oss;
-//     oss << std::fixed << std::setprecision(precision) << v;
-//     return oss.str();
-// }
-
-// std::vector<std::string> split(const std::string& s, char seperator)
-// {
-//     std::vector<std::string> output;
-//     std::string::size_type prev_pos = 0, pos = 0;
-
-//     while ((pos = s.find(seperator, pos)) != std::string::npos)
-//     {
-//         std::string substring(s.substr(prev_pos, pos - prev_pos));
-//         output.push_back(substring);
-//         prev_pos = ++pos;
-//     }
-
-//     output.push_back(s.substr(prev_pos, pos - prev_pos));
-//     return output;
-// }
-
-// static std::string basenameFromPath(const std::string& path)
-// {
-//     std::vector<std::string> parts = split(path, '/');
-//     if (parts.empty()) return path;
-//     return parts.back();
-// }
-
-// static std::string removeExtension(const std::string& filename)
-// {
-//     std::size_t dot_pos = filename.find_last_of('.');
-//     if (dot_pos == std::string::npos) return filename;
-//     return filename.substr(0, dot_pos);
-// }
-
-// static std::string extractPersonName(const std::string& img_path)
-// {
-//     std::string filename = basenameFromPath(img_path);
-//     std::string name_no_ext = removeExtension(filename);
-
-//     std::size_t underscore_pos = name_no_ext.find_last_of('_');
-//     if (underscore_pos == std::string::npos)
-//     {
-//         return name_no_ext;
-//     }
-
-//     return name_no_ext.substr(0, underscore_pos);
-// }
-
-// // ====================== FACE HELPERS ======================
-
-// cv::Mat createFaceLandmarkGTMatrix()
-// {
-//     float v1[5][2] = {
-//         {30.2946f, 51.6963f},
-//         {65.5318f, 51.5014f},
-//         {48.0252f, 71.7366f},
-//         {33.5493f, 92.3655f},
-//         {62.7299f, 92.2041f}
-//     };
-
-//     cv::Mat src(5, 2, CV_32FC1, v1);
-//     memcpy(src.data, v1, 2 * 5 * sizeof(float));
-//     return src.clone();
-// }
-
-// cv::Mat createFaceLandmarkMatrixfromBBox(const Bbox& box)
-// {
-//     float v2[5][2] = {
-//         {box.ppoint[0], box.ppoint[5]},
-//         {box.ppoint[1], box.ppoint[6]},
-//         {box.ppoint[2], box.ppoint[7]},
-//         {box.ppoint[3], box.ppoint[8]},
-//         {box.ppoint[4], box.ppoint[9]},
-//     };
-
-//     cv::Mat dst(5, 2, CV_32FC1, v2);
-//     memcpy(dst.data, v2, 2 * 5 * sizeof(float));
-//     return dst.clone();
-// }
-
-// Bbox getLargestBboxFromBboxVec(const std::vector<Bbox>& faces_info)
-// {
-//     if (faces_info.empty())
-//     {
-//         return Bbox();
-//     }
-
-//     int largest_idx = 0;
-//     float largest_area = 0.0f;
-
-//     for (int i = 0; i < (int)faces_info.size(); i++)
-//     {
-//         float w = faces_info[i].x2 - faces_info[i].x1;
-//         float h = faces_info[i].y2 - faces_info[i].y1;
-//         float area = w * h;
-
-//         if (area > largest_area)
-//         {
-//             largest_area = area;
-//             largest_idx = i;
-//         }
-//     }
-
-//     return faces_info[largest_idx];
-// }
-
-// static Bbox scaleBbox(const Bbox& box, float sx, float sy)
-// {
-//     Bbox out = box;
-
-//     out.x1 = box.x1 * sx;
-//     out.y1 = box.y1 * sy;
-//     out.x2 = box.x2 * sx;
-//     out.y2 = box.y2 * sy;
-
-//     for (int i = 0; i < 5; i++)
-//     {
-//         out.ppoint[i] = box.ppoint[i] * sx;
-//         out.ppoint[i + 5] = box.ppoint[i + 5] * sy;
-//     }
-
-//     return out;
-// }
-
-// LiveFaceBox Bbox2LiveFaceBox(const Bbox& box)
-// {
-//     LiveFaceBox live_box = {box.x1, box.y1, box.x2, box.y2};
-//     return live_box;
-// }
-
-// cv::Mat alignFaceImage(
-//     const cv::Mat& frame,
-//     const Bbox& bbox,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     cv::Mat face_landmark = createFaceLandmarkMatrixfromBBox(bbox);
-
-//     cv::Mat transf = FacePreprocess::similarTransform(
-//         face_landmark,
-//         gt_landmark_matrix
-//     );
-
-//     cv::Mat aligned = frame.clone();
-
-//     cv::warpPerspective(
-//         frame,
-//         aligned,
-//         transf,
-//         cv::Size(96, 112),
-//         INTER_LINEAR
-//     );
-
-//     cv::resize(
-//         aligned,
-//         aligned,
-//         cv::Size(112, 112),
-//         0,
-//         0,
-//         INTER_LINEAR
-//     );
-
-//     return aligned.clone();
-// }
-
-// // ====================== DRAW HELPERS ======================
-
-// static void drawTextWithBg(
-//     cv::Mat& img,
-//     const std::string& text,
-//     cv::Point org,
-//     double scale,
-//     cv::Scalar text_color,
-//     cv::Scalar bg_color,
-//     int thickness = 2
-// )
-// {
-//     int baseline = 0;
-
-//     cv::Size text_size = cv::getTextSize(
-//         text,
-//         cv::FONT_HERSHEY_SIMPLEX,
-//         scale,
-//         thickness,
-//         &baseline
-//     );
-
-//     cv::Rect bg_rect(
-//         org.x - 4,
-//         org.y - text_size.height - 6,
-//         text_size.width + 8,
-//         text_size.height + baseline + 10
-//     );
-
-//     bg_rect &= cv::Rect(0, 0, img.cols, img.rows);
-
-//     cv::rectangle(img, bg_rect, bg_color, cv::FILLED);
-
-//     cv::putText(
-//         img,
-//         text,
-//         org,
-//         cv::FONT_HERSHEY_SIMPLEX,
-//         scale,
-//         text_color,
-//         thickness
-//     );
-// }
-
-// static void drawAllDetectedFaces(
-//     cv::Mat& frame,
-//     const std::vector<Bbox>& faces
-// )
-// {
-//     for (const auto& box : faces)
-//     {
-//         cv::rectangle(
-//             frame,
-//             cv::Point((int)box.x1, (int)box.y1),
-//             cv::Point((int)box.x2, (int)box.y2),
-//             cv::Scalar(160, 160, 160),
-//             1
-//         );
-//     }
-// }
-
-// static void drawMainFaceResult(
-//     cv::Mat& frame,
-//     const CachedResult& cached,
-//     double fps,
-//     double loop_ms
-// )
-// {
-//     const Bbox& box = cached.display_box;
-//     const MatchResult& match = cached.match;
-
-//     bool unlock_ok = cached.is_real && match.known;
-
-//     cv::Scalar box_color;
-//     cv::Scalar status_bg;
-
-//     if (unlock_ok)
-//     {
-//         box_color = cv::Scalar(0, 255, 0);
-//         status_bg = cv::Scalar(0, 120, 0);
-//     }
-//     else if (!cached.is_real)
-//     {
-//         box_color = cv::Scalar(0, 0, 255);
-//         status_bg = cv::Scalar(0, 0, 160);
-//     }
-//     else
-//     {
-//         box_color = cv::Scalar(0, 255, 255);
-//         status_bg = cv::Scalar(0, 120, 120);
-//     }
-
-//     cv::rectangle(
-//         frame,
-//         cv::Point((int)box.x1, (int)box.y1),
-//         cv::Point((int)box.x2, (int)box.y2),
-//         box_color,
-//         3
-//     );
-
-//     std::string status_text;
-
-//     if (!cached.is_real)
-//     {
-//         status_text = "FAKE FACE";
-//     }
-//     else if (match.known)
-//     {
-//         status_text = "TRUE FACE - REGISTERED";
-//     }
-//     else
-//     {
-//         status_text = "TRUE FACE - UNKNOWN";
-//     }
-
-//     std::string name_text =
-//         "Name: " + match.name;
-
-//     std::string rec_text =
-//         "Rec score: " + fmtDouble(match.score, 3) +
-//         " / Th: " + fmtDouble(face_thre, 2);
-
-//     std::string live_text =
-//         "Live score: " + fmtDouble(cached.live_score, 3) +
-//         " / Th: " + fmtDouble(true_thre, 2);
-
-//     std::string perf_text =
-//         "FPS: " + fmtDouble(fps, 1) +
-//         " | Loop: " + fmtDouble(loop_ms, 1) + " ms" +
-//         " | Infer: " + fmtDouble(cached.last_infer_ms, 1) + " ms" +
-//         " | Step: " + std::to_string(PROCESS_EVERY_N_FRAMES);
-
-//     std::string face_text =
-//         "Faces: " + std::to_string(cached.face_count);
-
-//     int x = std::max(10, (int)box.x1);
-//     int y = std::max(30, (int)box.y1 - 15);
-
-//     drawTextWithBg(
-//         frame,
-//         status_text,
-//         cv::Point(x, y),
-//         0.75,
-//         cv::Scalar(255, 255, 255),
-//         status_bg,
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         name_text,
-//         cv::Point(x, y + 35),
-//         0.65,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(40, 40, 40),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         rec_text,
-//         cv::Point(x, y + 65),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(40, 40, 40),
-//         1
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         live_text,
-//         cv::Point(x, y + 92),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(40, 40, 40),
-//         1
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         perf_text + " | " + face_text,
-//         cv::Point(15, 35),
-//         0.62,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "Press q/ESC: quit | Press s: save current face",
-//         cv::Point(15, frame.rows - 20),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         1
-//     );
-// }
-
-// static void drawNoFaceUI(
-//     cv::Mat& frame,
-//     double fps,
-//     double infer_ms,
-//     double loop_ms
-// )
-// {
-//     drawTextWithBg(
-//         frame,
-//         "No face detected",
-//         cv::Point(15, 35),
-//         0.8,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 160),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "FPS: " + fmtDouble(fps, 1) +
-//         " | Loop: " + fmtDouble(loop_ms, 1) + " ms" +
-//         " | Infer: " + fmtDouble(infer_ms, 1) + " ms" +
-//         " | Step: " + std::to_string(PROCESS_EVERY_N_FRAMES),
-//         cv::Point(15, 70),
-//         0.6,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         2
-//     );
-
-//     drawTextWithBg(
-//         frame,
-//         "Press q/ESC: quit",
-//         cv::Point(15, frame.rows - 20),
-//         0.55,
-//         cv::Scalar(255, 255, 255),
-//         cv::Scalar(0, 0, 0),
-//         1
-//     );
-// }
-
-// // ====================== MODEL / USER DB ======================
-
-// void loadLiveModel(Live& live)
-// {
-//     ModelConfig config1 = {
-//         2.7f,
-//         0.0f,
-//         0.0f,
-//         80,
-//         80,
-//         "model_1",
-//         false
-//     };
-
-//     ModelConfig config2 = {
-//         4.0f,
-//         0.0f,
-//         0.0f,
-//         80,
-//         80,
-//         "model_2",
-//         false
-//     };
-
-//     vector<ModelConfig> configs;
-//     configs.emplace_back(config1);
-//     configs.emplace_back(config2);
-
-//     live.LoadModel(configs);
-// }
-
-// static cv::Mat prepareUserImageForFeature(
-//     const cv::Mat& input_img,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     if (input_img.empty())
-//     {
-//         return cv::Mat();
-//     }
-
-//     if (input_img.cols == 112 && input_img.rows == 112)
-//     {
-//         return input_img.clone();
-//     }
-
-//     std::vector<Bbox> faces = detect_mtcnn(input_img);
-
-//     if (!faces.empty())
-//     {
-//         Bbox largest = getLargestBboxFromBboxVec(faces);
-//         return alignFaceImage(input_img, largest, gt_landmark_matrix);
-//     }
-
-//     cv::Mat resized;
-//     cv::resize(
-//         input_img,
-//         resized,
-//         cv::Size(112, 112),
-//         0,
-//         0,
-//         INTER_LINEAR
-//     );
-
-//     return resized;
-// }
-
-// static void loadRegisteredUsers(
-//     Arcface& facereco,
-//     std::map<std::string, std::vector<cv::Mat>>& user_descriptors,
-//     const cv::Mat& gt_landmark_matrix
-// )
-// {
-//     ensureDir(USER_DIR);
-
-//     std::vector<cv::String> image_names;
-//     std::vector<cv::String> jpg_names;
-//     std::vector<cv::String> jpeg_names;
-//     std::vector<cv::String> png_names;
-
-//     cv::glob(USER_DIR + "/*.jpg", jpg_names, false);
-//     cv::glob(USER_DIR + "/*.jpeg", jpeg_names, false);
-//     cv::glob(USER_DIR + "/*.png", png_names, false);
-
-//     image_names.insert(image_names.end(), jpg_names.begin(), jpg_names.end());
-//     image_names.insert(image_names.end(), jpeg_names.begin(), jpeg_names.end());
-//     image_names.insert(image_names.end(), png_names.begin(), png_names.end());
-
-//     if (image_names.empty())
-//     {
-//         std::cerr << "[ERROR] No image files found in: "
-//                   << USER_DIR << std::endl;
-//         std::cerr << "[HINT] Put registered face images into users/ folder."
-//                   << std::endl;
-//         std::cerr << "[HINT] Example: users/Cong_001.jpg, users/Duc_001.jpg"
-//                   << std::endl;
-//         exit(0);
-//     }
-
-//     std::cout << "[INFO] Loading registered users from: "
-//               << USER_DIR << std::endl;
-//     std::cout << "[INFO] Total user images: "
-//               << image_names.size() << std::endl;
-
-//     int loaded = 0;
-//     int skipped = 0;
-
-//     for (const auto& img_name_cv : image_names)
-//     {
-//         std::string img_name = std::string(img_name_cv);
-//         std::string person_name = extractPersonName(img_name);
-
-//         cv::Mat img = cv::imread(img_name);
-
-//         if (img.empty())
-//         {
-//             std::cerr << "[WARN] Cannot read image: "
-//                       << img_name << std::endl;
-//             skipped++;
-//             continue;
-//         }
-
-//         cv::Mat face_img = prepareUserImageForFeature(
-//             img,
-//             gt_landmark_matrix
-//         );
-
-//         if (face_img.empty())
-//         {
-//             std::cerr << "[WARN] Cannot prepare face image: "
-//                       << img_name << std::endl;
-//             skipped++;
-//             continue;
-//         }
-
-//         cv::Mat descriptor = facereco.getFeature(face_img);
-//         descriptor = Statistics::zScore(descriptor);
-
-//         user_descriptors[person_name].push_back(descriptor);
-//         loaded++;
-
-//         std::cout << "[LOAD] "
-//                   << person_name
-//                   << " <= "
-//                   << basenameFromPath(img_name)
-//                   << std::endl;
-//     }
-
-//     std::cout << "[INFO] Loaded descriptors: "
-//               << loaded << std::endl;
-//     std::cout << "[INFO] Skipped images: "
-//               << skipped << std::endl;
-//     std::cout << "[INFO] Registered people: "
-//               << user_descriptors.size() << std::endl;
-
-//     if (user_descriptors.empty())
-//     {
-//         std::cerr << "[ERROR] No valid user descriptor loaded."
-//                   << std::endl;
-//         exit(0);
-//     }
-// }
-
-// static MatchResult findBestMatch(
-//     const std::map<std::string, std::vector<cv::Mat>>& user_descriptors,
-//     const cv::Mat& face_descriptor
-// )
-// {
-//     MatchResult result;
-//     result.name = "Unknown";
-//     result.score = -1.0;
-//     result.known = false;
-
-//     for (const auto& user_pair : user_descriptors)
-//     {
-//         const std::string& name = user_pair.first;
-//         const std::vector<cv::Mat>& descriptors = user_pair.second;
-
-//         for (const auto& ref_desc : descriptors)
-//         {
-//             double score = Statistics::cosineDistance(
-//                 ref_desc,
-//                 face_descriptor
-//             );
-
-//             if (score > result.score)
-//             {
-//                 result.score = score;
-//                 result.name = name;
-//             }
-//         }
-//     }
-
-//     if (result.score > face_thre)
-//     {
-//         result.known = true;
-//     }
-//     else
-//     {
-//         result.name = "Unknown";
-//         result.known = false;
-//     }
-
-//     return result;
-// }
-
-// static std::string makeSaveFileName(const std::string& name)
-// {
-//     auto now = std::chrono::system_clock::now();
-
-//     long long ms =
-//         std::chrono::duration_cast<std::chrono::milliseconds>(
-//             now.time_since_epoch()
-//         ).count();
-
-//     return USER_DIR + "/" + name + "_" + std::to_string(ms) + ".jpg";
-// }
-
-// // ====================== MAIN PIPELINE ======================
-
-// int MTCNNDetection()
-// {
-//     std::cout << "OpenCV Version: "
-//               << CV_MAJOR_VERSION << "."
-//               << CV_MINOR_VERSION << "."
-//               << CV_SUBMINOR_VERSION << std::endl;
-
-//     std::cout << "[INFO] project_path = "
-//               << project_path << std::endl;
-//     std::cout << "[INFO] USER_DIR     = "
-//               << USER_DIR << std::endl;
-//     std::cout << "[INFO] CSI CAMERA   = "
-//               << CAMERA_WIDTH << "x" << CAMERA_HEIGHT
-//               << "@" << CAMERA_FPS << std::endl;
-//     std::cout << "[INFO] PROCESS SIZE = "
-//               << PROCESS_WIDTH << "x" << PROCESS_HEIGHT << std::endl;
-//     std::cout << "[INFO] PROCESS STEP = every "
-//               << PROCESS_EVERY_N_FRAMES << " frames" << std::endl;
-//     std::cout << "[INFO] face_thre    = "
-//               << face_thre << std::endl;
-//     std::cout << "[INFO] true_thre    = "
-//               << true_thre << std::endl;
-
-//     ensureDir(USER_DIR);
-
-//     cv::Mat face_landmark_gt_matrix = createFaceLandmarkGTMatrix();
-
-//     Arcface facereco;
-
-//     std::map<std::string, std::vector<cv::Mat>> user_descriptors;
-
-//     loadRegisteredUsers(
-//         facereco,
-//         user_descriptors,
-//         face_landmark_gt_matrix
-//     );
-
-//     Live live;
-//     loadLiveModel(live);
-
-//     RpiCamRawCapture cap(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS);
-
-//     if (!cap.open())
-//     {
-//         std::cerr << "[ERROR] Cannot open CSI camera using rpicam-vid."
-//                   << std::endl;
-//         std::cerr << "[HINT] Test camera first:" << std::endl;
-//         std::cerr << "       rpicam-hello --list-cameras" << std::endl;
-//         std::cerr << "       rpicam-hello" << std::endl;
-//         std::cerr << "[HINT] Check log:" << std::endl;
-//         std::cerr << "       cat " << RPICAM_LOG << std::endl;
-//         return -1;
-//     }
-
-//     cv::namedWindow("LiveFaceReco - Smart Lock", cv::WINDOW_NORMAL);
-//     cv::resizeWindow(
-//         "LiveFaceReco - Smart Lock",
-//         DISPLAY_WIDTH,
-//         DISPLAY_HEIGHT
-//     );
-
-//     cv::Mat frame;
-//     cv::Mat process_frame;
-//     cv::Mat display_frame;
-
-//     CachedResult cached;
-
-//     int frame_count = 0;
-//     double smooth_fps = 0.0;
-//     double last_infer_ms = 0.0;
-//     double last_loop_ms = 0.0;
-
-//     std::cout << "[INFO] CSI camera started." << std::endl;
-//     std::cout << "[INFO] Press q or ESC to quit." << std::endl;
-//     std::cout << "[INFO] Press s to save current aligned face into users/."
-//               << std::endl;
-
-//     while (cap.isOpened())
-//     {
-//         auto loop_start = std::chrono::steady_clock::now();
-
-//         frame = cap.getFrame();
-
-//         if (frame.empty())
-//         {
-//             continue;
-//         }
-
-//         frame_count++;
-
-//         display_frame = frame.clone();
-
-//         bool should_process =
-//             (frame_count % PROCESS_EVERY_N_FRAMES == 0) ||
-//             (frame_count == 1);
-
-//         if (should_process)
-//         {
-//             auto infer_start = std::chrono::high_resolution_clock::now();
-
-//             cv::resize(
-//                 frame,
-//                 process_frame,
-//                 cv::Size(PROCESS_WIDTH, PROCESS_HEIGHT),
-//                 0,
-//                 0,
-//                 INTER_LINEAR
-//             );
-
-//             float sx = static_cast<float>(frame.cols) / PROCESS_WIDTH;
-//             float sy = static_cast<float>(frame.rows) / PROCESS_HEIGHT;
-
-//             std::vector<Bbox> faces_info = detect_mtcnn(process_frame);
-
-//             if (!faces_info.empty())
-//             {
-//                 Bbox largest_process_box =
-//                     getLargestBboxFromBboxVec(faces_info);
-
-//                 Bbox largest_display_box =
-//                     scaleBbox(largest_process_box, sx, sy);
-
-//                 LiveFaceBox live_face_box =
-//                     Bbox2LiveFaceBox(largest_process_box);
-
-//                 cv::Mat aligned_img = alignFaceImage(
-//                     process_frame,
-//                     largest_process_box,
-//                     face_landmark_gt_matrix
-//                 );
-
-//                 cv::Mat face_descriptor = facereco.getFeature(aligned_img);
-//                 face_descriptor = Statistics::zScore(face_descriptor);
-
-//                 MatchResult match = findBestMatch(
-//                     user_descriptors,
-//                     face_descriptor
-//                 );
-
-//                 double live_score =
-//                     live.Detect(process_frame, live_face_box);
-
-//                 live_score = clamp01(live_score);
-//                 bool is_real = live_score > true_thre;
-
-//                 cached.has_face = true;
-//                 cached.has_aligned_face = true;
-//                 cached.match = match;
-//                 cached.live_score = live_score;
-//                 cached.is_real = is_real;
-//                 cached.process_box = largest_process_box;
-//                 cached.display_box = largest_display_box;
-//                 cached.face_count = (int)faces_info.size();
-//                 cached.aligned_face = aligned_img.clone();
-
-//                 if (DRAW_ALL_FACES)
-//                 {
-//                     // Chỉ để debug nhẹ: update display bbox lớn nhất thôi.
-//                     // Nếu muốn vẽ tất cả bbox, cần scale từng bbox.
-//                 }
-//             }
-//             else
-//             {
-//                 cached.has_face = false;
-//                 cached.has_aligned_face = false;
-//                 cached.match = {"Unknown", -1.0, false};
-//                 cached.live_score = 0.0;
-//                 cached.is_real = false;
-//                 cached.face_count = 0;
-//                 cached.aligned_face.release();
-//             }
-
-//             auto infer_end = std::chrono::high_resolution_clock::now();
-
-//             last_infer_ms =
-//                 std::chrono::duration<double, std::milli>(
-//                     infer_end - infer_start
-//                 ).count();
-
-//             cached.last_infer_ms = last_infer_ms;
-//         }
-
-//         if (cached.has_face)
-//         {
-//             drawMainFaceResult(
-//                 display_frame,
-//                 cached,
-//                 smooth_fps,
-//                 last_loop_ms
-//             );
-//         }
-//         else
-//         {
-//             drawNoFaceUI(
-//                 display_frame,
-//                 smooth_fps,
-//                 last_infer_ms,
-//                 last_loop_ms
-//             );
-//         }
-
-//         cv::imshow("LiveFaceReco - Smart Lock", display_frame);
-
-//         int key = cv::waitKey(1);
-
-//         // Tính FPS ở cuối vòng lặp để số FPS bao gồm toàn bộ thời gian:
-//         // camera read + resize + detect + recognition + anti-spoof + draw + imshow + waitKey.
-//         // Cách cũ tính ngay sau cap.getFrame(), nên FPS có thể bị ảo cao dù hình vẫn giật.
-//         auto loop_end = std::chrono::steady_clock::now();
-
-//         double loop_dt = std::chrono::duration<double>(
-//             loop_end - loop_start
-//         ).count();
-
-//         if (loop_dt > 0.000001)
-//         {
-//             double instant_fps = 1.0 / loop_dt;
-//             last_loop_ms = loop_dt * 1000.0;
-
-//             if (smooth_fps <= 0.0)
-//             {
-//                 smooth_fps = instant_fps;
-//             }
-//             else
-//             {
-//                 const double alpha = 0.10;
-//                 smooth_fps =
-//                     (1.0 - alpha) * smooth_fps +
-//                     alpha * instant_fps;
-//             }
-//         }
-
-//         if (key == 27 || key == 'q' || key == 'Q')
-//         {
-//             break;
-//         }
-
-//         if (key == 's' || key == 'S')
-//         {
-//             if (cached.has_aligned_face && !cached.aligned_face.empty())
-//             {
-//                 std::string save_path = makeSaveFileName(SAVE_NAME);
-
-//                 bool ok = cv::imwrite(save_path, cached.aligned_face);
-
-//                 if (ok)
-//                 {
-//                     cv::Mat desc = facereco.getFeature(cached.aligned_face);
-//                     desc = Statistics::zScore(desc);
-//                     user_descriptors[SAVE_NAME].push_back(desc);
-
-//                     std::cout << "[SAVE] Saved new face: "
-//                               << save_path << std::endl;
-//                     std::cout << "[SAVE] Added descriptor to current database."
-//                               << std::endl;
-//                 }
-//                 else
-//                 {
-//                     std::cerr << "[ERROR] Cannot save image: "
-//                               << save_path << std::endl;
-//                 }
-//             }
-//             else
-//             {
-//                 std::cout << "[WARN] No current face to save."
-//                           << std::endl;
-//             }
-//         }
-
-//         if (frame_count % LOG_EVERY_N_FRAMES == 0)
-//         {
-//             std::cout << "[FRAME " << frame_count << "] ";
-
-//             if (cached.has_face)
-//             {
-//                 std::cout << "name=" << cached.match.name
-//                           << " | known="
-//                           << (cached.match.known ? "yes" : "no")
-//                           << " | rec_score="
-//                           << fmtDouble(cached.match.score, 3)
-//                           << " | live_score="
-//                           << fmtDouble(cached.live_score, 3)
-//                           << " | status="
-//                           << (cached.is_real ? "TRUE" : "FAKE")
-//                           << " | fps="
-//                           << fmtDouble(smooth_fps, 1)
-//                           << " | loop_ms="
-//                           << fmtDouble(last_loop_ms, 1)
-//                           << " | infer_ms="
-//                           << fmtDouble(cached.last_infer_ms, 1)
-//                           << std::endl;
-//             }
-//             else
-//             {
-//                 std::cout << "no face"
-//                           << " | fps="
-//                           << fmtDouble(smooth_fps, 1)
-//                           << " | loop_ms="
-//                           << fmtDouble(last_loop_ms, 1)
-//                           << " | infer_ms="
-//                           << fmtDouble(last_infer_ms, 1)
-//                           << std::endl;
-//             }
-//         }
-//     }
-
-//     cap.close();
-//     cv::destroyAllWindows();
-
-//     std::cout << "[INFO] CSI camera stopped." << std::endl;
-
-//     return 0;
-// }
-
-
-
-
-
-
-
-
-
 //
 // Optimized Realtime Live Face Recognition GUI for Raspberry Pi 4 + CSI OV5647
 // - Capture CSI camera using rpicam-vid YUV420 pipe
@@ -1206,6 +13,8 @@
 //   total inference time, and per-model AI time: detect / recognition / anti-spoof
 // - Gamma Correction + Laplacian Sharpening are applied only for face recognition branch
 // - Unlock: REAL + Known 2s -> send '1'; wait 5s -> count 2s again to resend '1'
+// - ESP32 feedback on same UART: receive '2'=WRONG_PIN, '3'=FACE_ACCEPTED, '4'=KEYPAD_ACCEPTED
+// - Pi writes Firestore logs and local snapshots for face fail + ESP32 feedback events
 // - Press q to quit main window
 //
 
@@ -1308,12 +117,12 @@ static const std::string RPICAM_LOG = "/tmp/rpicam_livefacereco.log";
 // ====================== FIRESTORE CONFIG ======================
 //
 // Firebase Authentication account dùng chung cho Raspberry Pi và ESP32.
-// Raspberry Pi trong file này CHỈ gửi:
+// Raspberry Pi tạo log Firestore cho:
 //   - SPOOF_DETECTED : phát hiện FAKE FACE
 //   - UNKNOWN_FACE   : REAL FACE nhưng không nhận diện được
-//
-// Các event khác như WRONG_PIN / ACCESS_ACCEPTED dành cho ESP32 sau này,
-// Raspberry Pi không tạo các log đó trong code này.
+//   - WRONG_PIN      : ESP32 gửi phản hồi '2'
+//   - ACCESS_ACCEPTED bằng face  : ESP32 gửi phản hồi '3'
+//   - ACCESS_ACCEPTED bằng keypad: ESP32 gửi phản hồi '4'
 //
 static const bool ENABLE_FIRESTORE_LOG = true;
 
@@ -1373,6 +182,17 @@ static const std::string ESP32_SERIAL_PORT = "/dev/serial0";
 static const int ESP32_SERIAL_BAUD = 9600;
 static const double VALID_FACE_UNLOCK_HOLD_SECONDS = 2.0;
 static const double UNLOCK_RECHECK_DELAY_SECONDS = 5.0;
+
+// ESP32 gửi ngược về Pi qua cùng UART:
+//   '2' -> WRONG_PIN, method="keypad", result="DENIED"
+//   '3' -> FACE_ACCESS_ACCEPTED, method="face", result="GRANTED"
+//   '4' -> KEYPAD_ACCESS_ACCEPTED, method="keypad", result="GRANTED"
+//
+// Với lệnh '3', Pi ưu tiên lấy userName từ lần face unlock gần nhất.
+// Nếu quá cửa sổ này thì fallback sang cached result hiện tại, sau đó mới dùng "Unknown".
+static const double FACE_GRANTED_CONTEXT_WINDOW_SECONDS = 6.0;
+static const double ESP32_FEEDBACK_LOG_DEBOUNCE_SECONDS = 1.0;
+static const int ESP32_UART_MAX_READ_PER_LOOP = 16;
 
 // ====================================================
 
@@ -1521,7 +341,7 @@ public:
         worker_thread_ = std::thread(&FirestoreLogger::workerLoop, this);
 
         std::cout << "[FIRESTORE] Logger ON."
-                  << " Pi only sends SPOOF_DETECTED or UNKNOWN_FACE."
+                  << " Pi can send face denied, face granted, keypad granted, and wrong PIN logs."
                   << std::endl;
         return true;
     }
@@ -1557,8 +377,61 @@ public:
         return enabled_.load();
     }
 
-    bool enqueueDeniedEvent(
+    static bool isAllowedAccessLogFields(
+        const std::string& method,
+        const std::string& result,
         const std::string& reason,
+        const std::string& user_name
+    )
+    {
+        const bool method_ok = (method == "face" || method == "keypad");
+        const bool result_ok = (result == "GRANTED" || result == "DENIED");
+        const bool reason_ok =
+            reason == "ACCESS_ACCEPTED" ||
+            reason == "UNKNOWN_FACE" ||
+            reason == "SPOOF_DETECTED" ||
+            reason == "WRONG_PIN";
+
+        if (!method_ok || !result_ok || !reason_ok || user_name.empty())
+        {
+            return false;
+        }
+
+        // Khớp Firestore Rules:
+        // - Face denied: chỉ UNKNOWN_FACE / SPOOF_DETECTED và userName="Unknown".
+        if (method == "face" &&
+            result == "DENIED" &&
+            user_name == "Unknown" &&
+            (reason == "UNKNOWN_FACE" || reason == "SPOOF_DETECTED"))
+        {
+            return true;
+        }
+
+        // - Keypad denied: chỉ WRONG_PIN và userName="Unknown".
+        if (method == "keypad" &&
+            result == "DENIED" &&
+            user_name == "Unknown" &&
+            reason == "WRONG_PIN")
+        {
+            return true;
+        }
+
+        // - Granted: method face/keypad đều được, reason phải ACCESS_ACCEPTED.
+        if ((method == "face" || method == "keypad") &&
+            result == "GRANTED" &&
+            reason == "ACCESS_ACCEPTED")
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    bool enqueueAccessEvent(
+        const std::string& method,
+        const std::string& result,
+        const std::string& reason,
+        const std::string& user_name,
         const cv::Mat& snapshot_frame,
         const CachedResult& cached
     )
@@ -1568,16 +441,22 @@ public:
             return false;
         }
 
-        // Chặn cứng phía Pi: không gửi event khác hai loại fail khuôn mặt.
-        if (reason != "SPOOF_DETECTED" && reason != "UNKNOWN_FACE")
+        if (!isAllowedAccessLogFields(method, result, reason, user_name))
         {
-            std::cerr << "[FIRESTORE] Block invalid Pi event: "
-                      << reason << std::endl;
+            std::cerr << "[FIRESTORE] Block invalid access event: "
+                      << "method=" << method
+                      << " | result=" << result
+                      << " | reason=" << reason
+                      << " | userName=" << user_name
+                      << std::endl;
             return false;
         }
 
         FirestoreLogEvent event;
         event.document_id = createDocumentId();
+        event.user_name = user_name;
+        event.method = method;
+        event.result = result;
         event.reason = reason;
         event.captured_at_local = createLocalTimestamp();
         event.live_score = cached.live_score;
@@ -1603,6 +482,23 @@ public:
 
         queue_cv_.notify_one();
         return true;
+    }
+
+    bool enqueueDeniedEvent(
+        const std::string& reason,
+        const cv::Mat& snapshot_frame,
+        const CachedResult& cached
+    )
+    {
+        // Giữ API cũ cho PiDeniedEventGate: face denied luôn log Unknown.
+        return enqueueAccessEvent(
+            "face",
+            "DENIED",
+            reason,
+            "Unknown",
+            snapshot_frame,
+            cached
+        );
     }
 
 private:
@@ -1984,10 +880,20 @@ private:
 
     bool sendToFirestore(const FirestoreLogEvent& event)
     {
-        // Chặn cứng thêm lần nữa trước khi thực sự gửi HTTPS.
-        if (event.reason != "SPOOF_DETECTED" &&
-            event.reason != "UNKNOWN_FACE")
+        // Chặn cứng thêm lần nữa trước khi thực sự gửi HTTPS,
+        // khớp với Firestore Rules hiện tại.
+        if (!isAllowedAccessLogFields(
+                event.method,
+                event.result,
+                event.reason,
+                event.user_name))
         {
+            std::cerr << "[FIRESTORE] Refuse to send invalid event: "
+                      << "method=" << event.method
+                      << " | result=" << event.result
+                      << " | reason=" << event.reason
+                      << " | userName=" << event.user_name
+                      << std::endl;
             return false;
         }
 
@@ -3759,7 +2665,7 @@ public:
     {
         fd_ = ::open(
             device_path_.c_str(),
-            O_RDWR | O_NOCTTY | O_SYNC
+            O_RDWR | O_NOCTTY | O_NONBLOCK
         );
 
         if (fd_ < 0)
@@ -3797,8 +2703,10 @@ public:
         tty.c_iflag &= ~IGNBRK;
         tty.c_lflag = 0;
         tty.c_oflag = 0;
+
+        // Non-blocking read: Pi vẫn chạy camera/AI mượt, không bị đợi UART.
         tty.c_cc[VMIN] = 0;
-        tty.c_cc[VTIME] = 10;
+        tty.c_cc[VTIME] = 0;
 
         tty.c_iflag &= ~(IXON | IXOFF | IXANY);
         tty.c_cflag |= (CLOCAL | CREAD);
@@ -3820,6 +2728,8 @@ public:
 
         std::cout << "[UART] Connected to ESP32: "
                   << device_path_ << " @ " << baud_rate_ << " baud."
+                  << std::endl;
+        std::cout << "[UART] Pi TX sends '1'/'0'. Pi RX listens for '2'/'3'/'4'."
                   << std::endl;
 
         // Khởi động an toàn: báo đóng khóa trước.
@@ -3873,6 +2783,59 @@ public:
         return true;
     }
 
+    bool readCommand(char& command)
+    {
+        if (!isOpened())
+        {
+            return false;
+        }
+
+        // Đọc tối đa vài byte rác trong một lần gọi để tránh kẹt loop.
+        for (int i = 0; i < 32; i++)
+        {
+            char data = 0;
+            const ssize_t n = ::read(fd_, &data, 1);
+
+            if (n == 1)
+            {
+                if (data == '2' || data == '3' || data == '4')
+                {
+                    command = data;
+                    std::cout << "[UART] <<< ESP32 event '"
+                              << command << "'" << std::endl;
+                    return true;
+                }
+
+                // Nếu ESP32 dùng println(), bỏ qua xuống dòng.
+                if (data == '\r' || data == '\n' || data == ' ' || data == '\t')
+                {
+                    continue;
+                }
+
+                std::cerr << "[UART] Ignore unknown byte from ESP32: '"
+                          << data << "' (" << (int)(unsigned char)data << ")"
+                          << std::endl;
+                continue;
+            }
+
+            if (n == 0)
+            {
+                return false;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return false;
+            }
+
+            std::cerr << "[UART] Read failed: errno="
+                      << errno << std::endl;
+            return false;
+        }
+
+        return false;
+    }
+
     void closePort()
     {
         if (fd_ >= 0)
@@ -3903,7 +2866,8 @@ public:
           recheck_delay_seconds_(std::max(0.0, recheck_delay_seconds)),
           valid_timer_started_(false),
           waiting_for_recheck_(false),
-          unlock_sent_in_session_(false)
+          unlock_sent_in_session_(false),
+          last_face_unlock_sent_(false)
     {
     }
 
@@ -3996,6 +2960,13 @@ public:
             valid_timer_started_ = false;
             last_unlock_time_ = now;
 
+            // Lưu context để khi ESP32 phản hồi '3', Pi log đúng user face granted.
+            last_face_unlock_sent_ = true;
+            last_face_unlock_time_ = now;
+            last_face_unlock_user_ = cached.match.name.empty()
+                ? "Unknown"
+                : cached.match.name;
+
             std::cout << "[UNLOCK] Access valid for "
                       << fmtDouble(valid_seconds, 1)
                       << "s. ESP32 unlock sent for user="
@@ -4004,6 +2975,35 @@ public:
                       << fmtDouble(recheck_delay_seconds_, 1)
                       << "s." << std::endl;
         }
+    }
+
+    bool consumeRecentFaceUnlockAck(
+        const std::chrono::steady_clock::time_point& now,
+        double max_ack_age_seconds,
+        std::string& user_name
+    )
+    {
+        if (!last_face_unlock_sent_)
+        {
+            return false;
+        }
+
+        const double age_seconds =
+            std::chrono::duration<double>(
+                now - last_face_unlock_time_
+            ).count();
+
+        if (age_seconds > max_ack_age_seconds)
+        {
+            last_face_unlock_sent_ = false;
+            return false;
+        }
+
+        user_name = last_face_unlock_user_.empty()
+            ? "Unknown"
+            : last_face_unlock_user_;
+        last_face_unlock_sent_ = false;
+        return true;
     }
 
     void resetAndLock(Esp32SerialController& serial)
@@ -4024,6 +3024,7 @@ public:
         valid_timer_started_ = false;
         waiting_for_recheck_ = false;
         unlock_sent_in_session_ = false;
+        last_face_unlock_sent_ = false;
         serial.sendState(0, true);
     }
 
@@ -4035,8 +3036,132 @@ private:
     bool waiting_for_recheck_;
     bool unlock_sent_in_session_;
 
+    // Context cho phản hồi '3' từ ESP32 sau face unlock.
+    bool last_face_unlock_sent_;
+    std::string last_face_unlock_user_;
+
     std::chrono::steady_clock::time_point valid_start_time_;
     std::chrono::steady_clock::time_point last_unlock_time_;
+    std::chrono::steady_clock::time_point last_face_unlock_time_;
+};
+
+class Esp32FeedbackLogGate
+{
+public:
+    explicit Esp32FeedbackLogGate(double debounce_seconds)
+        : debounce_seconds_(std::max(0.0, debounce_seconds)),
+          has_last_event_(false),
+          last_command_(0)
+    {
+    }
+
+    void observe(
+        char command,
+        const cv::Mat& snapshot_frame,
+        const CachedResult& cached,
+        ValidFaceUnlockGate& valid_face_unlock_gate,
+        FirestoreLogger& logger
+    )
+    {
+        if (command != '2' && command != '3' && command != '4')
+        {
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (has_last_event_ && command == last_command_)
+        {
+            const double dt =
+                std::chrono::duration<double>(now - last_event_time_).count();
+
+            if (dt < debounce_seconds_)
+            {
+                std::cout << "[ESP32_EVENT] Debounce duplicate command '"
+                          << command << "' after "
+                          << fmtDouble(dt, 2) << "s" << std::endl;
+                return;
+            }
+        }
+
+        std::string method;
+        std::string result;
+        std::string reason;
+        std::string user_name;
+
+        if (command == '2')
+        {
+            // ESP32 báo nhập sai PIN.
+            method = "keypad";
+            result = "DENIED";
+            reason = "WRONG_PIN";
+            user_name = "Unknown";
+        }
+        else if (command == '3')
+        {
+            // ESP32 xác nhận mở khóa do face unlock từ Pi.
+            method = "face";
+            result = "GRANTED";
+            reason = "ACCESS_ACCEPTED";
+
+            std::string face_user;
+            const bool has_recent_face_context =
+                valid_face_unlock_gate.consumeRecentFaceUnlockAck(
+                    now,
+                    FACE_GRANTED_CONTEXT_WINDOW_SECONDS,
+                    face_user
+                );
+
+            if (has_recent_face_context && !face_user.empty())
+            {
+                user_name = face_user;
+            }
+            else if (cached.has_face && cached.is_real && cached.match.known &&
+                     !cached.match.name.empty())
+            {
+                user_name = cached.match.name;
+            }
+            else
+            {
+                user_name = "Unknown";
+            }
+        }
+        else // command == '4'
+        {
+            // ESP32 xác nhận mở khóa do nhập đúng keypad PIN.
+            method = "keypad";
+            result = "GRANTED";
+            reason = "ACCESS_ACCEPTED";
+            user_name = "KeypadUser";
+        }
+
+        if (logger.enqueueAccessEvent(
+                method,
+                result,
+                reason,
+                user_name,
+                snapshot_frame,
+                cached))
+        {
+            has_last_event_ = true;
+            last_command_ = command;
+            last_event_time_ = now;
+
+            std::cout << "[ESP32_EVENT] Queue Firestore log: "
+                      << "cmd='" << command << "'"
+                      << " | method=" << method
+                      << " | result=" << result
+                      << " | reason=" << reason
+                      << " | userName=" << user_name
+                      << std::endl;
+        }
+    }
+
+private:
+    double debounce_seconds_;
+    bool has_last_event_;
+    char last_command_;
+    std::chrono::steady_clock::time_point last_event_time_;
 };
 
 
@@ -4142,6 +3267,9 @@ int MTCNNDetection()
         VALID_FACE_UNLOCK_HOLD_SECONDS,
         UNLOCK_RECHECK_DELAY_SECONDS
     );
+    Esp32FeedbackLogGate esp32_feedback_log_gate(
+        ESP32_FEEDBACK_LOG_DEBOUNCE_SECONDS
+    );
 
     bool esp32_serial_ready = false;
     if (ENABLE_ESP32_UNLOCK_SIGNAL)
@@ -4169,6 +3297,12 @@ int MTCNNDetection()
         std::cout << "[FIRESTORE] Continuous failure relog cycle: "
                   << fmtDouble(FIRESTORE_CONTINUOUS_FAIL_CYCLE_SECONDS, 1)
                   << " seconds." << std::endl;
+        std::cout << "[FIRESTORE] ESP32 feedback logs: "
+                  << "'2'=WRONG_PIN, "
+                  << "'3'=FACE_ACCESS_ACCEPTED, "
+                  << "'4'=KEYPAD_ACCESS_ACCEPTED. "
+                  << "Snapshots are saved locally too."
+                  << std::endl;
     }
 
     if (ENABLE_ESP32_UNLOCK_SIGNAL)
@@ -4480,6 +3614,36 @@ int MTCNNDetection()
             );
         }
 
+        if (ENABLE_ESP32_UNLOCK_SIGNAL && esp32_serial_ready)
+        {
+            char esp32_command = 0;
+            int read_count = 0;
+
+            while (read_count < ESP32_UART_MAX_READ_PER_LOOP &&
+                   esp32_serial.readCommand(esp32_command))
+            {
+                read_count++;
+
+                if (ENABLE_FIRESTORE_LOG && firestore_logger.isEnabled())
+                {
+                    esp32_feedback_log_gate.observe(
+                        esp32_command,
+                        display_frame,
+                        cached,
+                        valid_face_unlock_gate,
+                        firestore_logger
+                    );
+                }
+                else
+                {
+                    std::cout << "[ESP32_EVENT] Received command '"
+                              << esp32_command
+                              << "' but Firestore logger is OFF."
+                              << std::endl;
+                }
+            }
+        }
+
         if (has_new_inference_result &&
             ENABLE_FIRESTORE_LOG &&
             firestore_logger.isEnabled())
@@ -4547,6 +3711,7 @@ int MTCNNDetection()
 
     if (ENABLE_ESP32_UNLOCK_SIGNAL && esp32_serial_ready)
     {
+        valid_face_unlock_gate.shutdown(esp32_serial);
         // closePort() tự gửi ASCII '0' trước khi đóng UART.
         esp32_serial.closePort();
     }
