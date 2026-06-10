@@ -23,7 +23,7 @@ using namespace cv;
 const bool largest_face_only=true;
 const bool record_face=true;
 const int distance_threshold = 90;
-const float face_thre=0.8;
+const float face_thre=0.7;
 const float true_thre=0.8;
 const int jump=10;
 const int input_width = 320;

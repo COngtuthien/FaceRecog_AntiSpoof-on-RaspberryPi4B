@@ -13,7 +13,7 @@
 //   total inference time, and per-model AI time: detect / recognition / anti-spoof
 // - Gamma Correction + Laplacian Sharpening are applied only for face recognition branch
 // - Unlock: REAL + Known 2s -> send '1'; wait 5s -> count 2s again to resend '1'
-// - ESP32 feedback on same UART: receive '2'=WRONG_PIN, '3'=FACE_ACCEPTED, '4'=KEYPAD_ACCEPTED
+// - ESP32 feedback on same UART: receive '2'=WRONG_PIN, '3'=FACE_ACCEPTED, '4'=KEYPAD_ACCEPTED, '5'=GEOFENCING_ACCEPTED
 // - Pi writes Firestore logs and local snapshots for face fail + ESP32 feedback events
 // - Press q to quit main window
 //
@@ -123,6 +123,7 @@ static const std::string RPICAM_LOG = "/tmp/rpicam_livefacereco.log";
 //   - WRONG_PIN      : ESP32 gửi phản hồi '2'
 //   - ACCESS_ACCEPTED bằng face  : ESP32 gửi phản hồi '3'
 //   - ACCESS_ACCEPTED bằng keypad: ESP32 gửi phản hồi '4'
+//   - ACCESS_ACCEPTED bằng geofencing: ESP32 gửi phản hồi '5'
 //
 static const bool ENABLE_FIRESTORE_LOG = true;
 
@@ -187,6 +188,7 @@ static const double UNLOCK_RECHECK_DELAY_SECONDS = 5.0;
 //   '2' -> WRONG_PIN, method="keypad", result="DENIED"
 //   '3' -> FACE_ACCESS_ACCEPTED, method="face", result="GRANTED"
 //   '4' -> KEYPAD_ACCESS_ACCEPTED, method="keypad", result="GRANTED"
+//   '5' -> GEOFENCING_ACCESS_ACCEPTED, method="geofencing", result="GRANTED"
 //
 // Với lệnh '3', Pi ưu tiên lấy userName từ lần face unlock gần nhất.
 // Nếu quá cửa sổ này thì fallback sang cached result hiện tại, sau đó mới dùng "Unknown".
@@ -341,7 +343,7 @@ public:
         worker_thread_ = std::thread(&FirestoreLogger::workerLoop, this);
 
         std::cout << "[FIRESTORE] Logger ON."
-                  << " Pi can send face denied, face granted, keypad granted, and wrong PIN logs."
+                  << " Pi can send face denied, face granted, keypad granted, geofencing granted, and wrong PIN logs."
                   << std::endl;
         return true;
     }
@@ -384,7 +386,8 @@ public:
         const std::string& user_name
     )
     {
-        const bool method_ok = (method == "face" || method == "keypad");
+        const bool method_ok =
+            (method == "face" || method == "keypad" || method == "geofencing");
         const bool result_ok = (result == "GRANTED" || result == "DENIED");
         const bool reason_ok =
             reason == "ACCESS_ACCEPTED" ||
@@ -416,8 +419,8 @@ public:
             return true;
         }
 
-        // - Granted: method face/keypad đều được, reason phải ACCESS_ACCEPTED.
-        if ((method == "face" || method == "keypad") &&
+        // - Granted: method face/keypad/geofencing đều được, reason phải ACCESS_ACCEPTED.
+        if ((method == "face" || method == "keypad" || method == "geofencing") &&
             result == "GRANTED" &&
             reason == "ACCESS_ACCEPTED")
         {
@@ -2729,7 +2732,7 @@ public:
         std::cout << "[UART] Connected to ESP32: "
                   << device_path_ << " @ " << baud_rate_ << " baud."
                   << std::endl;
-        std::cout << "[UART] Pi TX sends '1'/'0'. Pi RX listens for '2'/'3'/'4'."
+        std::cout << "[UART] Pi TX sends '1'/'0'. Pi RX listens for '2'/'3'/'4'/'5'."
                   << std::endl;
 
         // Khởi động an toàn: báo đóng khóa trước.
@@ -2798,7 +2801,7 @@ public:
 
             if (n == 1)
             {
-                if (data == '2' || data == '3' || data == '4')
+                if (data == '2' || data == '3' || data == '4' || data == '5')
                 {
                     command = data;
                     std::cout << "[UART] <<< ESP32 event '"
@@ -3063,7 +3066,8 @@ public:
         FirestoreLogger& logger
     )
     {
-        if (command != '2' && command != '3' && command != '4')
+        if (command != '2' && command != '3' &&
+            command != '4' && command != '5')
         {
             return;
         }
@@ -3126,13 +3130,21 @@ public:
                 user_name = "Unknown";
             }
         }
-        else // command == '4'
+        else if (command == '4')
         {
             // ESP32 xác nhận mở khóa do nhập đúng keypad PIN.
             method = "keypad";
             result = "GRANTED";
             reason = "ACCESS_ACCEPTED";
             user_name = "KeypadUser";
+        }
+        else // command == '5'
+        {
+            // ESP32 xác nhận mở khóa do geofencing.
+            method = "geofencing";
+            result = "GRANTED";
+            reason = "ACCESS_ACCEPTED";
+            user_name = "GeofencingUser";
         }
 
         if (logger.enqueueAccessEvent(
@@ -3300,7 +3312,8 @@ int MTCNNDetection()
         std::cout << "[FIRESTORE] ESP32 feedback logs: "
                   << "'2'=WRONG_PIN, "
                   << "'3'=FACE_ACCESS_ACCEPTED, "
-                  << "'4'=KEYPAD_ACCESS_ACCEPTED. "
+                  << "'4'=KEYPAD_ACCESS_ACCEPTED, "
+                  << "'5'=GEOFENCING_ACCESS_ACCEPTED. "
                   << "Snapshots are saved locally too."
                   << std::endl;
     }
